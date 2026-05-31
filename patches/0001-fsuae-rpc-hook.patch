@@ -1,0 +1,33 @@
+diff --git a/Makefile.am b/Makefile.am
+index 234a66e3..61c9f710 100644
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -255,6 +255,7 @@ libuae_a_SOURCES = \
+ 	src/custom.cpp \
+ 	src/debug.cpp \
+ 	src/debuginfo.cpp \
++	src/fsuae_rpc.cpp \
+ 	src/def_icons.cpp \
+ 	src/devices.cpp \
+ 	src/disk.cpp \
+diff --git a/src/main.cpp b/src/main.cpp
+index 7040dfe4..59e16624 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -742,6 +742,8 @@ static int restart_program;
+ static TCHAR restart_config[MAX_DPATH];
+ static int default_config;
+ 
++extern "C" void fsuae_rpc_init(void);
++
+ void uae_reset (int hardreset, int keyboardreset)
+ {
+ 	if (debug_dma) {
+@@ -1193,6 +1195,7 @@ static int real_main2 (int argc, TCHAR **argv)
+ 			}
+ 			currprefs.produce_sound = 0;
+ 		}
++		fsuae_rpc_init();
+ 		start_program ();
+ 	}
+ 	return 0;

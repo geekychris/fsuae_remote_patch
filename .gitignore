@@ -1,0 +1,11 @@
+# Local build artifacts and editor scratch — not part of the project
+*.swp
+*.swo
+.DS_Store
+.idea/
+.vscode/
+
+# In case someone runs build.sh with FSUAE_SRC inside the repo:
+fsuae-src/
+fs-uae/
+*.uss
