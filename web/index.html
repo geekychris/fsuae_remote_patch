@@ -211,7 +211,7 @@ async function refresh() {
         renderCustom(custom);
         if (state.state === 'paused') {
             try {
-                const disasm = await api('GET', `/v1/disasm?addr=${cpu.pc}&count=20`);
+                const disasm = await api('GET', `/v1/disasm?addr=${cpu.pc}&count=20&annotate=1`);
                 renderDisasm(disasm, cpu.pc);
             } catch(e) {}
         }
@@ -256,6 +256,15 @@ function renderRegs(cpu) {
 
 function renderDisasm(disasm, currentPc) {
     const html = disasm.lines.map(line => {
+        // The line may already contain an "; exec.Func()" suffix from
+        // the server-side annotator.  Split it off so we render the
+        // mnemonic and the annotation separately.
+        let annot = '';
+        const annIdx = line.indexOf('; exec.');
+        if (annIdx >= 0) {
+            annot = line.slice(annIdx);
+            line = line.slice(0, annIdx).replace(/\s+$/, '');
+        }
         // Parse "ADDR HEXBYTES MNEMONIC" pattern
         const m = line.match(/^([0-9A-F]+)\s+([0-9a-f\s]+?)\s+(.+)$/);
         let addr = '?', bytes = '', mnem = line;
@@ -265,12 +274,15 @@ function renderDisasm(disasm, currentPc) {
             mnem = m[3];
         }
         const cls = addr === currentPc ? 'disasm-line current' : 'disasm-line';
-        // Symbol annotation: if mnem references a known addr, highlight it
-        let sym = '';
-        const symMatch = mnem.match(/\$([0-9a-fA-F]{1,8})/);
-        if (symMatch) {
-            const s = symbolTable['0x' + symMatch[1].toLowerCase().padStart(8, '0')];
-            if (s) sym = `; ${s}`;
+        // Address-table annotation: if mnem references a known addr,
+        // highlight it.  (Used in addition to the FD annotation.)
+        let sym = annot;
+        if (!sym) {
+            const symMatch = mnem.match(/\$([0-9a-fA-F]{1,8})/);
+            if (symMatch) {
+                const key = '0x' + symMatch[1].toLowerCase().padStart(8, '0');
+                if (symbolTable[key]) sym = `; ${symbolTable[key]}`;
+            }
         }
         return `<div class="${cls}"><span class="addr">${addr}</span>` +
                `<span class="bytes">${bytes}</span>` +
@@ -365,7 +377,7 @@ $('#disasm-go').onclick = async () => {
     const a = $('#disasm-addr').value;
     if (!a) return;
     const addr = (a === 'pc') ? lastCpuState.pc : a;
-    const d = await api('GET', `/v1/disasm?addr=${addr}&count=20`);
+    const d = await api('GET', `/v1/disasm?addr=${addr}&count=20&annotate=1`);
     renderDisasm(d, lastCpuState.pc);
 };
 $('#bp-add').onclick = async () => {

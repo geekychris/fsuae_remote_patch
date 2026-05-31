@@ -34,7 +34,10 @@
  * v1 endpoints — inspection:
  *     GET  /v1/cpu                         CPU registers + PC + SR
  *     GET  /v1/mem?addr=HEX&len=N          read N bytes from addr, hex string
- *     GET  /v1/disasm?addr=HEX&count=N     disassemble N insns from addr
+ *     GET  /v1/disasm?addr=HEX&count=N&annotate=1
+ *                                          disassemble N insns from addr
+ *                                          (annotate=1 adds exec.fn() to
+ *                                           JSR/JMP -nn(A6) lines)
  *     GET  /v1/custom                      Amiga chipset register snapshot
  *
  * v1 endpoints — mutation (paused-state recommended):
@@ -45,6 +48,12 @@
  * v1 endpoints — state snapshots:
  *     POST /v1/state/save?path=ABS_PATH    save state to absolute path
  *     POST /v1/state/load?path=ABS_PATH    restore state from path
+ *
+ * v1 endpoints — symbol resolution:
+ *     GET  /v1/symbols                     full known-address table
+ *     GET  /v1/symbols/lookup?addr=HEX     lookup name for an address
+ *     GET  /v1/fd/exec                     exec.library function table
+ *     GET  /v1/fd/lookup?offset=N          lookup exec function by -offset
  *
  * v1 endpoints — breakpoints & watchpoints:
  *     POST /v1/breakpoints?addr=HEX        install PC breakpoint, auto-pause on hit
@@ -107,6 +116,10 @@ void memwatch_setup(void);
 void initialize_memwatch(int mode);
 extern int skipaddr_doskip;
 extern int no_trace_exceptions;
+
+/* Forward decl — defined later in this file; used by the disasm
+ * annotator before its full definition. */
+static const char *exec_fd_lookup(int neg_offset);
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -718,9 +731,17 @@ static void ep_disasm(int fd, const char *qs) {
     uaecptr nextpc = 0;
     m68k_disasm_2(dbuf, bufsz, addr, &nextpc, count, NULL, NULL, 1);
 
-    /* JSON-escape any backslash or quote in the disasm text.  The 68k
-     * disassembler doesn't produce control chars or non-ASCII so this is
-     * a simple pass. */
+    /* Optional annotation: if annotate=1 (or ?annot=1), look at each
+     * line for `JSR -nn(A6)` and `JMP -nn(A6)` and append the matching
+     * exec-library function name (if known).  This is heuristic — it
+     * blindly assumes A6 points to ExecBase, which holds for most
+     * Kickstart code but not for app code that swaps A6 to other libs. */
+    int annotate = 0;
+    char *anns = get_query_param(qs, "annotate");
+    if (!anns) anns = get_query_param(qs, "annot");
+    if (anns && (anns[0] == '1' || anns[0] == 'y' || anns[0] == 'Y'))
+        annotate = 1;
+
     static char body[131072];
     int n = snprintf(body, sizeof body,
         "{\"ok\":true,\"addr\":\"0x%08x\",\"nextpc\":\"0x%08x\",\"lines\":[",
@@ -739,10 +760,49 @@ static void ep_disasm(int fd, const char *qs) {
                 body[n++] = '\\';
                 body[n++] = *c;
             } else if ((unsigned char)*c < 0x20) {
-                /* skip control characters (tabs get rendered as spaces) */
                 body[n++] = ' ';
             } else {
                 body[n++] = *c;
+            }
+        }
+        /* Try to annotate JSR / JMP with -nn(A6).  m68k_disasm_2 prints
+         * the form `JSR -nn(A6)` or `JSR (A6, -$nn)` depending on the
+         * branch — we match both. */
+        if (annotate) {
+            char line[1024];
+            int llen = (eol - p) < (int)sizeof line - 1 ? (int)(eol - p) : (int)sizeof line - 1;
+            memcpy(line, p, llen);
+            line[llen] = 0;
+            const char *fn = NULL;
+            /* Look for "(A6, -$xxxx)" or "$ffffXXXX,A6" style references */
+            char *paren = strstr(line, "(A6,");
+            if (!paren) paren = strstr(line, "(a6,");
+            if (paren) {
+                /* Find the displacement.  Format: " -$XX,A6) == $.." */
+                char *dollar = strchr(paren, '$');
+                if (dollar) {
+                    int neg = (dollar > line && dollar[-1] == '-') ||
+                              strstr(paren, "-$") != NULL;
+                    /* Parse hex displacement until ')' or ',' */
+                    int v = 0;
+                    char *d = dollar + 1;
+                    while ((*d >= '0' && *d <= '9') ||
+                           (*d >= 'a' && *d <= 'f') ||
+                           (*d >= 'A' && *d <= 'F')) {
+                        v = (v << 4) | (*d >= 'a' ? *d - 'a' + 10 :
+                                        *d >= 'A' ? *d - 'A' + 10 : *d - '0');
+                        d++;
+                    }
+                    /* If parsed as positive hex with leading 0xFFFF, it's the
+                     * 16-bit signed displacement in unsigned form. */
+                    if (v > 0x7FFF) v -= 0x10000;
+                    if (neg && v > 0) v = -v;
+                    if (v < 0) fn = exec_fd_lookup(v);
+                }
+            }
+            if (fn) {
+                n += snprintf(body + n, sizeof body - n,
+                    "       ; exec.%s()", fn);
             }
         }
         n += snprintf(body + n, sizeof body - n, "\"");
@@ -1068,6 +1128,171 @@ static void ep_sym_lookup(int fd, const char *qs) {
         snprintf(body, sizeof body,
             "{\"ok\":true,\"addr\":\"0x%08x\",\"name\":null}\n",
             (unsigned)addr);
+    }
+    send_response(fd, 200, body);
+}
+
+/* ----- AmigaOS Function Descriptor (.fd) lookup -----
+ *
+ * AmigaOS libraries are called via a fixed offset from the library base
+ * register (conventionally A6 for exec, A4 in some BCPL code, etc.):
+ *
+ *   MOVEA.L  $4.W, A6        ; A6 = ExecBase
+ *   JSR      -132(A6)        ; FindResident()
+ *
+ * The .fd file format maps these negative offsets to function names.
+ * We embed the exec.library FD table here as a static array (the most
+ * commonly referenced library on the Amiga); other libraries can be
+ * loaded at runtime via POST /v1/fd/load.
+ *
+ * Each function's offset is its NEGATIVE distance from the library
+ * base.  In exec, Supervisor is at -30, ExitIntr at -36, ... — the
+ * bias starts at 30 and the offset increments by 6 per function.       */
+
+struct fd_entry { int offset; const char *name; const char *args; };
+
+/* exec.library FD (Kickstart 1.3, exec V34).  ~80 most-used functions.
+ * Offsets are NEGATIVE (i.e. JSR -30(A6) is Supervisor). */
+static const struct fd_entry EXEC_FD[] = {
+    {-30,  "Supervisor",        "userFunction"},
+    {-36,  "ExitIntr",          ""},
+    {-42,  "Schedule",          ""},
+    {-48,  "Reschedule",        ""},
+    {-54,  "Switch",            ""},
+    {-60,  "Dispatch",          ""},
+    {-66,  "Exception",         ""},
+    {-72,  "InitCode",          "startClass, version"},
+    {-78,  "InitStruct",        "initTable, memory, size"},
+    {-84,  "MakeLibrary",       "funcInit, structInit, libInit, dataSize, segList"},
+    {-90,  "MakeFunctions",     "target, functionArray, funcDispBase"},
+    {-96,  "FindResident",      "name"},
+    {-102, "InitResident",      "resident, segList"},
+    {-108, "Alert",             "alertNum"},
+    {-114, "Debug",             "flags"},
+    {-120, "Disable",           ""},
+    {-126, "Enable",            ""},
+    {-132, "Forbid",            ""},
+    {-138, "Permit",            ""},
+    {-144, "SetSR",             "newSR, mask"},
+    {-150, "SuperState",        ""},
+    {-156, "UserState",         "sysStack"},
+    {-162, "SetIntVector",      "intNumber, interrupt"},
+    {-168, "AddIntServer",      "intNumber, interrupt"},
+    {-174, "RemIntServer",      "intNumber, interrupt"},
+    {-180, "Cause",             "interrupt"},
+    {-186, "Allocate",          "freeList, byteSize"},
+    {-192, "Deallocate",        "freeList, memoryBlock, byteSize"},
+    {-198, "AllocMem",          "byteSize, requirements"},
+    {-204, "AllocAbs",          "byteSize, location"},
+    {-210, "FreeMem",           "memoryBlock, byteSize"},
+    {-216, "AvailMem",          "requirements"},
+    {-222, "AllocEntry",        "entry"},
+    {-228, "FreeEntry",         "entry"},
+    {-234, "Insert",            "list, node, pred"},
+    {-240, "AddHead",           "list, node"},
+    {-246, "AddTail",           "list, node"},
+    {-252, "Remove",            "node"},
+    {-258, "RemHead",           "list"},
+    {-264, "RemTail",           "list"},
+    {-270, "Enqueue",           "list, node"},
+    {-276, "FindName",          "list, name"},
+    {-282, "AddTask",           "task, initialPC, finalPC"},
+    {-288, "RemTask",           "task"},
+    {-294, "FindTask",          "name"},
+    {-300, "SetTaskPri",        "task, priority"},
+    {-306, "SetSignal",         "newSignals, signalSet"},
+    {-312, "SetExcept",         "newSignals, signalSet"},
+    {-318, "Wait",              "signalSet"},
+    {-324, "Signal",            "task, signalSet"},
+    {-330, "AllocSignal",       "signalNum"},
+    {-336, "FreeSignal",        "signalNum"},
+    {-342, "AllocTrap",         "trapNum"},
+    {-348, "FreeTrap",          "trapNum"},
+    {-354, "AddPort",           "port"},
+    {-360, "RemPort",           "port"},
+    {-366, "PutMsg",            "port, message"},
+    {-372, "GetMsg",            "port"},
+    {-378, "ReplyMsg",          "message"},
+    {-384, "WaitPort",          "port"},
+    {-390, "FindPort",          "name"},
+    {-396, "AddLibrary",        "library"},
+    {-402, "RemLibrary",        "library"},
+    {-408, "OldOpenLibrary",    "libName"},
+    {-414, "CloseLibrary",      "library"},
+    {-420, "SetFunction",       "library, funcOffset, newFunction"},
+    {-426, "SumLibrary",        "library"},
+    {-432, "AddDevice",         "device"},
+    {-438, "RemDevice",         "device"},
+    {-444, "OpenDevice",        "devName, unit, ioRequest, flags"},
+    {-450, "CloseDevice",       "ioRequest"},
+    {-456, "DoIO",              "ioRequest"},
+    {-462, "SendIO",            "ioRequest"},
+    {-468, "CheckIO",           "ioRequest"},
+    {-474, "WaitIO",            "ioRequest"},
+    {-480, "AbortIO",           "ioRequest"},
+    {-486, "AddResource",       "resource"},
+    {-492, "RemResource",       "resource"},
+    {-498, "OpenResource",      "resName"},
+    {-552, "RawDoFmt",          "formatString, dataStream, putChProc, putChData"},
+    {-558, "GetCC",             ""},
+    {-564, "TypeOfMem",         "address"},
+    {-570, "Procure",           "semaport, bidMsg"},
+    {-576, "Vacate",            "semaport"},
+    {-582, "OpenLibrary",       "libName, version"},
+    /* V36+ semaphore functions land at -588 onward in newer kickstarts */
+    {-588, "InitSemaphore",     "sigSem"},
+    {-594, "ObtainSemaphore",   "sigSem"},
+    {-600, "ReleaseSemaphore",  "sigSem"},
+    {-606, "AttemptSemaphore",  "sigSem"},
+    {-624, "FindSemaphore",     "name"},
+    {-630, "AddSemaphore",      "sigSem"},
+    {-636, "RemSemaphore",      "sigSem"},
+    {-648, "AddMemList",        "size, attributes, pri, base, name"},
+    {-624, "CopyMem",           "source, dest, size"},
+    {-630, "CopyMemQuick",      "source, dest, size"},
+};
+
+static const char *exec_fd_lookup(int neg_offset) {
+    for (size_t i = 0; i < sizeof EXEC_FD / sizeof EXEC_FD[0]; i++) {
+        if (EXEC_FD[i].offset == neg_offset) return EXEC_FD[i].name;
+    }
+    return NULL;
+}
+
+static void ep_fd_exec(int fd) {
+    static char body[8192];
+    int n = snprintf(body, sizeof body, "{\"ok\":true,\"library\":\"exec\",\"functions\":[");
+    for (size_t i = 0; i < sizeof EXEC_FD / sizeof EXEC_FD[0]; i++) {
+        n += snprintf(body + n, sizeof body - n,
+            "%s{\"offset\":%d,\"name\":\"%s\",\"args\":\"%s\"}",
+            i ? "," : "",
+            EXEC_FD[i].offset,
+            EXEC_FD[i].name,
+            EXEC_FD[i].args);
+        if (n >= (int)sizeof body - 256) break;
+    }
+    n += snprintf(body + n, sizeof body - n, "]}\n");
+    send_response(fd, 200, body);
+}
+
+static void ep_fd_lookup(int fd, const char *qs) {
+    char *os = get_query_param(qs, "offset");
+    if (!os) { err_response(fd, 400, "missing offset"); return; }
+    char obuf[32];
+    snprintf(obuf, sizeof obuf, "%s", os);
+    /* Offsets are typically given as negative; accept both -132 and 132. */
+    int off = atoi(obuf);
+    if (off > 0) off = -off;
+    const char *name = exec_fd_lookup(off);
+    char body[256];
+    if (name) {
+        snprintf(body, sizeof body,
+            "{\"ok\":true,\"library\":\"exec\",\"offset\":%d,\"name\":\"%s\"}\n",
+            off, name);
+    } else {
+        snprintf(body, sizeof body,
+            "{\"ok\":true,\"library\":\"exec\",\"offset\":%d,\"name\":null}\n",
+            off);
     }
     send_response(fd, 200, body);
 }
@@ -1414,6 +1639,10 @@ static void handle_request(int fd) {
         ep_sym_list(fd);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/symbols/lookup") == 0) {
         ep_sym_lookup(fd, qs);
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/fd/exec") == 0) {
+        ep_fd_exec(fd);
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/fd/lookup") == 0) {
+        ep_fd_lookup(fd, qs);
     } else {
         err_response(fd, 404, "no such endpoint");
     }
