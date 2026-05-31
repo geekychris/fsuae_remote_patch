@@ -11,9 +11,18 @@ index 234a66e3..61c9f710 100644
  	src/devices.cpp \
  	src/disk.cpp \
 diff --git a/src/debug.cpp b/src/debug.cpp
-index 18cb5e0b..0c70bcc2 100644
+index 18cb5e0b..366b436b 100644
 --- a/src/debug.cpp
 +++ b/src/debug.cpp
+@@ -55,7 +55,7 @@
+ 
+ int debugger_active;
+ static uaecptr skipaddr_start, skipaddr_end;
+-static int skipaddr_doskip;
++int skipaddr_doskip;
+ static uae_u32 skipins;
+ static int do_skip;
+ static int debug_rewind;
 @@ -2320,7 +2320,7 @@ static void smc_free (void)
  	smc_table = NULL;
  }

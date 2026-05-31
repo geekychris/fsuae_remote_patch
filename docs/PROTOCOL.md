@@ -51,6 +51,38 @@ Stops the emulator by calling `activate_debugger()`. Returns
 Resumes emulation by calling `deactivate_debugger()`. Returns
 `{"ok":true,"state":"running"}`.
 
+If any watchpoints are installed, this automatically calls
+`memwatch_setup()` first to re-wrap the memory banks. This is needed
+because `/v1/reset` re-initializes the bank dispatch table and would
+otherwise leave watchpoints dead.
+
+## `POST /v1/step?n=N`
+
+Execute N instructions then re-pause. Default `n=1`. Maps to FS-UAE's
+internal `t` trace command.
+
+```json
+{"ok":true,"stepped":1}
+```
+
+After this returns, poll `/v1/state` until `"paused"` (usually
+sub-millisecond for small N). Then read `/v1/cpu` for the new PC.
+
+**Note:** for `n>1`, watchpoints and breakpoints are still honored
+mid-step — if a WP/BP fires before the step count is reached, the
+emulator pauses early. Check `/v1/state` and `/v1/cpu` after each step
+to determine why it paused.
+
+## `POST /v1/watchpoints/rearm`
+
+Force a re-call of `memwatch_setup()` without changing any watchpoint
+state. Use after `/v1/reset` if you don't immediately call `/v1/resume`
+(which auto-rearms).
+
+```json
+{"ok":true}
+```
+
 ## `POST /v1/state/save?path=ABS_PATH`
 
 Save state snapshot to disk. `path` must be absolute. Produces a
@@ -96,7 +128,7 @@ Remove all breakpoints.
 {"ok":true,"cleared":1}
 ```
 
-## `POST /v1/watchpoints?addr=HEX&size=N&rwi=R|W|I|RW|RWI`
+## `POST /v1/watchpoints?addr=HEX&size=N&rwi=R|W|I|RW|RWI&mustchange=0|1`
 
 Install a memory watchpoint. The emulator pauses when any access in
 range `[addr, addr+size)` matches the requested rwi (Read / Write /
@@ -109,6 +141,7 @@ Query params:
 | `addr` | yes | — | start of watched range |
 | `size` | no | 1 | bytes covered (`64` for 16 longwords) |
 | `rwi` | no | `RW` | any combination of R, W, I (e.g. `W`, `RW`, `RWI`) |
+| `mustchange` | no | `0` | `1` → only fire if write actually changes memory (skip writes-of-same-value) |
 
 ```json
 {"ok":true,"slot":0,"addr":"0x000000c0","size":64,"rwi":2}

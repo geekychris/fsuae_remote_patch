@@ -30,6 +30,7 @@
  *     GET  /v1/mem?addr=HEX&len=N          read N bytes from addr, hex string
  *     POST /v1/pause                       activate_debugger (stop the emu)
  *     POST /v1/resume                      deactivate_debugger (resume)
+ *     POST /v1/step?n=N                    execute N instructions then pause
  *     POST /v1/state/save?path=ABS_PATH    save state to absolute path
  *     POST /v1/breakpoints?addr=HEX        install PC breakpoint, auto-pause on hit
  *     GET  /v1/breakpoints                 list active breakpoints
@@ -38,6 +39,7 @@
  *                                          install memory watchpoint (rwi = R|W|RW)
  *     GET  /v1/watchpoints                 list active watchpoints
  *     POST /v1/watchpoints/clear           remove all watchpoints
+ *     POST /v1/watchpoints/rearm           re-wrap mem banks (use after /v1/reset)
  *     POST /v1/reset?hard=1                trigger reset (hard=1 default, 0=soft)
  *
  * Conventions:
@@ -66,10 +68,12 @@
 #include "uae.h"
 
 /* The patch un-statics these so we can drive memwatch installation
- * without re-entering the in-process debugger command parser.
+ * and single-step without re-entering the in-process debugger command parser.
  * Defined in debug.cpp (C++ linkage); declared here to match. */
 void memwatch_setup(void);
 void initialize_memwatch(int mode);
+extern int skipaddr_doskip;
+extern int no_trace_exceptions;
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -228,9 +232,59 @@ static void ep_pause(int fd) {
     send_response(fd, 200, "{\"ok\":true,\"state\":\"paused\"}\n");
 }
 
+/* If any watchpoints exist, re-arm the memwatch bank-wrapping.  This is
+ * a no-op if the wrap is already in place, but it's needed after every
+ * /v1/reset because the reset path re-initializes mem_banks back to the
+ * native (non-wrapped) implementations. */
+static void rearm_watchpoints_if_any(void) {
+    for (int i = 0; i < MEMWATCH_TOTAL; i++) {
+        if (mwnodes[i].size != 0) {
+            memwatch_setup();
+            return;
+        }
+    }
+}
+
 static void ep_resume(int fd) {
+    rearm_watchpoints_if_any();
     deactivate_debugger();
     send_response(fd, 200, "{\"ok\":true,\"state\":\"running\"}\n");
+}
+
+/* External — defined in debug.cpp.  These globals control single-stepping. */
+extern int debugging;
+
+static void ep_step(int fd, const char *qs) {
+    /* Execute N instructions then re-pause.  Maps to FS-UAE's 't' trace
+     * command internals: set skipaddr_doskip to step count, set
+     * exception_debugging, set SPCFLAG_BRK.
+     *
+     * We must clear debugger_active (so the debugger's inner stdin-read
+     * loop returns and the CPU resumes) WITHOUT clearing `debugging` —
+     * the CPU loop only re-enters debug() when `debugging` is true, and
+     * that re-entry is what makes single-stepping work. */
+    char *ns = get_query_param(qs, "n");
+    int n = 1;
+    if (ns) {
+        char nbuf[16];
+        snprintf(nbuf, sizeof nbuf, "%s", ns);
+        int ok = 0;
+        n = (int)parse_uint(nbuf, &ok);
+        if (!ok || n < 1 || n > 10000) {
+            err_response(fd, 400, "bad n (1..10000)");
+            return;
+        }
+    }
+    rearm_watchpoints_if_any();
+    skipaddr_doskip = n;
+    no_trace_exceptions = 1;
+    exception_debugging = 1;
+    debugging = 1;            /* keep CPU loop checking SPCFLAG_BRK -> debug() */
+    debugger_active = 0;      /* let debug_1's inner stdin-read loop return */
+    set_special(SPCFLAG_BRK);
+    char body[128];
+    snprintf(body, sizeof body, "{\"ok\":true,\"stepped\":%d}\n", n);
+    send_response(fd, 200, body);
 }
 
 static void ep_state_save(int fd, const char *qs) {
@@ -392,7 +446,11 @@ static void ep_wp_add(int fd, const char *qs) {
     mwn->access_mask = MW_MASK_ALL;
     mwn->reg = 0xFFFFFFFF;
     mwn->frozen = 0;
-    mwn->mustchange = 0;
+    /* mustchange=1 → only fire if the write actually changes memory
+     * (skips writes-of-same-value, useful for finding the FIRST modifying
+     * write to an address after a memset-style init). */
+    char *mc = get_query_param(qs, "mustchange");
+    mwn->mustchange = (mc && (mc[0]=='1' || mc[0]=='y' || mc[0]=='Y')) ? 1 : 0;
     mwn->modval = 0;
     mwn->modval_written = 0;
     mwn->pc = 0xFFFFFFFF;
@@ -462,6 +520,11 @@ static void handle_request(int fd) {
         ep_pause(fd);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/resume") == 0) {
         ep_resume(fd);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/step") == 0) {
+        ep_step(fd, qs);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/watchpoints/rearm") == 0) {
+        memwatch_setup();
+        send_response(fd, 200, "{\"ok\":true}\n");
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/state/save") == 0) {
         ep_state_save(fd, qs);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/breakpoints") == 0) {
