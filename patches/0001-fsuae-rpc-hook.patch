@@ -11,10 +11,10 @@ index 234a66e3..61c9f710 100644
  	src/devices.cpp \
  	src/disk.cpp \
 diff --git a/src/debug.cpp b/src/debug.cpp
-index 18cb5e0b..366b436b 100644
+index 18cb5e0b..cf145202 100644
 --- a/src/debug.cpp
 +++ b/src/debug.cpp
-@@ -55,7 +55,7 @@
+@@ -55,11 +55,11 @@
  
  int debugger_active;
  static uaecptr skipaddr_start, skipaddr_end;
@@ -23,6 +23,20 @@ index 18cb5e0b..366b436b 100644
  static uae_u32 skipins;
  static int do_skip;
  static int debug_rewind;
+-static int memwatch_triggered;
++int memwatch_triggered;
+ int memwatch_enabled;
+ static uae_u16 sr_bpmask, sr_bpvalue;
+ int debugging;
+@@ -2167,7 +2167,7 @@ struct breakpoint_node bpnodes[BREAKPOINT_TOTAL];
+ static addrbank **debug_mem_banks;
+ static addrbank *debug_mem_area;
+ struct memwatch_node mwnodes[MEMWATCH_TOTAL];
+-static struct memwatch_node mwhit;
++struct memwatch_node mwhit;
+ 
+ static uae_u8 *illgdebug, *illghdebug;
+ static int illgdebug_break;
 @@ -2320,7 +2320,7 @@ static void smc_free (void)
  	smc_table = NULL;
  }

@@ -55,6 +55,8 @@
  *     GET  /v1/watchpoints                 list active watchpoints
  *     POST /v1/watchpoints/clear           remove all watchpoints
  *     POST /v1/watchpoints/rearm           re-wrap mem banks (use after /v1/reset)
+ *     GET  /v1/watchpoints/last            details of last triggered watchpoint
+ *                                          (PC at hit, addr, value, etc.)
  *
  * Conventions:
  *     - addr / len / value query params accept decimal, 0x-prefixed hex,
@@ -767,6 +769,48 @@ static void ep_custom(int fd) {
 
 /* ----- State load ----- */
 
+/* memwatch_func records the trigger context here: PC, addr, value, rwi,
+ * size, access_mask, and reg.  Reading these is the only reliable way to
+ * find the exact PC that triggered a watchpoint — by the time the
+ * debugger pauses, an IRQ may have already redirected the CPU.        */
+extern struct memwatch_node mwhit;
+extern int memwatch_triggered;
+
+static void ep_wp_last(int fd) {
+    char body[1024];
+    /* memwatch_triggered = slot_index + 1, or 0 if nothing fired since
+     * last clear.  Surface both the trigger context and "no hit". */
+    if (memwatch_triggered == 0) {
+        snprintf(body, sizeof body, "{\"ok\":true,\"hit\":false}\n");
+        send_response(fd, 200, body);
+        return;
+    }
+    /* Decode rwi back into the user-visible RWI flags. */
+    char rwi_str[8] = "";
+    int p = 0;
+    if (mwhit.rwi & 1) rwi_str[p++] = 'R';
+    if (mwhit.rwi & 2) rwi_str[p++] = 'W';
+    if (mwhit.rwi & 4) rwi_str[p++] = 'I';
+    rwi_str[p] = 0;
+    snprintf(body, sizeof body,
+        "{\"ok\":true,\"hit\":true,"
+        "\"slot\":%d,"
+        "\"addr\":\"0x%08x\","
+        "\"pc\":\"0x%08x\","
+        "\"rwi\":\"%s\","
+        "\"size\":%d,"
+        "\"value\":\"0x%08x\","
+        "\"access_mask\":\"0x%08x\"}\n",
+        memwatch_triggered - 1,
+        (unsigned)mwhit.addr,
+        (unsigned)mwhit.pc,
+        rwi_str,
+        mwhit.size,
+        (unsigned)mwhit.val,
+        (unsigned)mwhit.access_mask);
+    send_response(fd, 200, body);
+}
+
 static void ep_state_load(int fd, const char *qs) {
     char *path = get_query_param(qs, "path");
     if (!path || !*path) { err_response(fd, 400, "missing path"); return; }
@@ -819,6 +863,8 @@ static void handle_request(int fd) {
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/watchpoints/rearm") == 0) {
         memwatch_setup();
         send_response(fd, 200, "{\"ok\":true}\n");
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/watchpoints/last") == 0) {
+        ep_wp_last(fd);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/state/save") == 0) {
         ep_state_save(fd, qs);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/breakpoints") == 0) {
