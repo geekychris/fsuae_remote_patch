@@ -85,6 +85,25 @@ index 7040dfe4..59e16624 100644
  		start_program ();
  	}
  	return 0;
+diff --git a/src/newcpu.cpp b/src/newcpu.cpp
+index 05c5b1c2..bdc404db 100644
+--- a/src/newcpu.cpp
++++ b/src/newcpu.cpp
+@@ -5370,6 +5370,14 @@ void m68k_go (int may_quit)
+ 				write_log (_T("hardreset, memory cleared\n"));
+ 			}
+ 			cpu_hardreset = false;
++
++			/* fsuae_rpc hook: after a reset rewires the mem_banks back
++			 * to their native handlers, re-wrap them so watchpoints
++			 * installed via the RPC continue to fire.  Safe no-op if
++			 * memwatch was never enabled. */
++			extern int memwatch_enabled;
++			extern void memwatch_setup(void);
++			if (memwatch_enabled) memwatch_setup();
+ #ifdef SAVESTATE
+ 			/* We may have been restoring state, but we're done now.  */
+ 			if (isrestore ()) {
 diff --git a/src/od-fs/uaemisc.cpp b/src/od-fs/uaemisc.cpp
 index de3577d6..9da7dd32 100644
 --- a/src/od-fs/uaemisc.cpp

@@ -1,7 +1,8 @@
 # fsuae_remote_patch
 
-A small patch + drop-in source file that adds an HTTP/JSON-RPC remote-control
-surface to [FS-UAE](https://fs-uae.net/).
+A patch + drop-in source file that turns [FS-UAE](https://fs-uae.net/) into a
+full cross-platform Amiga debugger backend, with an HTTP/JSON-RPC API, a
+WebSocket event stream, a built-in web UI, and Amiga-aware symbol resolution.
 
 Out of the box, FS-UAE only exposes its debugger interactively in the GUI
 window (you press `Pause` then `` ` `` to drop into the prompt). That makes it
@@ -81,6 +82,25 @@ Each endpoint is a thin wrapper around an existing internal FS-UAE function:
 
 | Endpoint | Wraps |
 |---|---|
+**Web UI**
+
+| Endpoint | Returns |
+|---|---|
+| `GET /` or `GET /v1/ui` | self-contained single-page debugger UI (HTML/JS/CSS embedded in the binary) |
+
+Open `http://127.0.0.1:8765/` in any browser — live CPU regs, disasm,
+memory hex dump, chipset state, breakpoints, watchpoints, all driven by
+the JSON-RPC API and the WebSocket event stream.
+
+**WebSocket event stream**
+
+| Endpoint | Returns |
+|---|---|
+| `GET /v1/events` (with `Upgrade: websocket`) | push channel for `paused`, `running`, `wp_hit` events |
+
+Frames are plain JSON, one per WebSocket message.  Eliminates polling
+`/v1/state` in tight loops.
+
 **Execution control**
 
 | Endpoint | Wraps |
@@ -90,7 +110,7 @@ Each endpoint is a thin wrapper around an existing internal FS-UAE function:
 | `POST /v1/pause` | `activate_debugger()` |
 | `POST /v1/resume` | `deactivate_debugger()` + auto-rearm watchpoints |
 | `POST /v1/step?n=N` | trace-step N instructions then re-pause |
-| `POST /v1/reset?hard=0\|1` | `uae_reset()` |
+| `POST /v1/reset?hard=0\|1` | `uae_reset()` (memwatch survives via post-reset hook) |
 
 **Inspection**
 
@@ -122,26 +142,40 @@ Each endpoint is a thin wrapper around an existing internal FS-UAE function:
 | `POST /v1/breakpoints?addr` | writes `bpnodes[]` directly |
 | `GET /v1/breakpoints` | reads `bpnodes[]` |
 | `POST /v1/breakpoints/clear` | clears all `bpnodes[]` |
-| `POST /v1/watchpoints?addr&size&rwi&mustchange` | writes `mwnodes[]` + `memwatch_setup()` |
+| `POST /v1/watchpoints?addr&size&rwi&mustchange&val&valmask` | writes `mwnodes[]` + `memwatch_setup()` |
 | `GET /v1/watchpoints` | reads `mwnodes[]` |
+| `GET /v1/watchpoints/last` | last triggered WP — addr, PC, value (real trigger PC, not post-IRQ PC) |
 | `POST /v1/watchpoints/clear` | clears all `mwnodes[]` |
 | `POST /v1/watchpoints/rearm` | force re-call of `memwatch_setup()` |
 
+**Symbol resolution** (built-in Amiga register names + 68k vectors)
+
+| Endpoint | Returns |
+|---|---|
+| `GET /v1/symbols` | full table (~140 entries) — chipset regs, CIA-A/B, 68k vectors |
+| `GET /v1/symbols/lookup?addr=X` | name + description for that address (`null` if unknown) |
+
 The patch also:
 
-- Un-`static`s `memwatch_setup()`, `initialize_memwatch()`, and
-  `skipaddr_doskip` in `debug.cpp` so the RPC can install
-  watchpoints + drive single-step without re-entering FS-UAE's
-  interactive console command parser.
+- Un-`static`s `memwatch_setup()`, `initialize_memwatch()`,
+  `skipaddr_doskip`, `mwhit`, and `memwatch_triggered` in `debug.cpp`
+  so the RPC can install watchpoints + drive single-step + read trigger
+  context without re-entering FS-UAE's interactive console command
+  parser.
 - Patches `console_get()` in `od-fs/uaemisc.cpp` to *block on stdin
   EOF* instead of treating it as "resume". This makes `/v1/pause` and
   watchpoint/breakpoint pauses *actually stick* when FS-UAE is launched
   with stdin redirected from `/dev/null` (the common case for a
   background-process driven by RPC).
+- Adds a post-reset hook in `newcpu.cpp` that calls `memwatch_setup()`
+  automatically after every `uae_reset()` — so watchpoints survive
+  hard-resets without manual re-arm dances.
 
-Total added: one new C++ file (~700 lines), one `extern "C"` decl,
-one function call, four `static`→non-`static` changes, and ~20 lines
-in `console_get()`. No new external dependencies.
+Total added: one new C++ file (~1100 lines), one `extern "C"` decl,
+one function call, six `static`→non-`static` changes, ~20 lines in
+`console_get()`, and 5 lines in the reset path. No new external
+dependencies (the WebSocket handshake includes a tiny inline SHA-1 +
+base64 — no OpenSSL).
 
 ## Build dependencies
 

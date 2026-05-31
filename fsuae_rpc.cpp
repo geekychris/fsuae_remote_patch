@@ -51,7 +51,10 @@
  *     GET  /v1/breakpoints                 list active breakpoints
  *     POST /v1/breakpoints/clear           remove all breakpoints
  *     POST /v1/watchpoints?addr=HEX&size=N&rwi=W&mustchange=0|1
+ *                              &val=HEX&valmask=HEX
  *                                          install memory watchpoint
+ *                                          (val/valmask filter — fire only on
+ *                                           matching value)
  *     GET  /v1/watchpoints                 list active watchpoints
  *     POST /v1/watchpoints/clear           remove all watchpoints
  *     POST /v1/watchpoints/rearm           re-wrap mem banks (use after /v1/reset)
@@ -94,6 +97,9 @@ extern uae_u16 dmacon;
 extern uae_u16 intena, intreq;
 extern unsigned int bplcon0;
 
+/* Embedded single-page web debugger.  Generated from web/index.html.   */
+#include "web_index.inc"
+
 /* The patch un-statics these so we can drive memwatch installation
  * and single-step without re-entering the in-process debugger command parser.
  * Defined in debug.cpp (C++ linkage); declared here to match. */
@@ -107,10 +113,12 @@ extern int no_trace_exceptions;
 #include <string.h>
 #include <ctype.h>
 #include <errno.h>
+#include <stdint.h>
 
 #ifndef _WIN32
 # include <pthread.h>
 # include <unistd.h>
+# include <signal.h>
 # include <sys/socket.h>
 # include <netinet/in.h>
 # include <arpa/inet.h>
@@ -136,12 +144,16 @@ static void send_str(int fd, const char *s) {
     }
 }
 
-static void send_response(int fd, int code, const char *body) {
-    char hdr[256];
+static void send_response_ct(int fd, int code, const char *body,
+                              size_t body_len, const char *content_type) {
+    char hdr[512];
     snprintf(hdr, sizeof hdr,
         "HTTP/1.1 %d %s\r\n"
-        "Content-Type: application/json\r\n"
+        "Content-Type: %s\r\n"
         "Content-Length: %zu\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Allow-Methods: GET, POST\r\n"
+        "Access-Control-Allow-Headers: Content-Type\r\n"
         "Connection: close\r\n"
         "\r\n",
         code,
@@ -149,9 +161,25 @@ static void send_response(int fd, int code, const char *body) {
         code == 400 ? "Bad Request" :
         code == 404 ? "Not Found" :
         code == 500 ? "Internal Server Error" : "Other",
-        strlen(body));
+        content_type, body_len);
     send_str(fd, hdr);
-    send_str(fd, body);
+    /* Write the body raw — may contain NULs in binary cases, but for
+     * our JSON / HTML responses it's always C-string-safe.            */
+    size_t off = 0;
+    while (off < body_len) {
+        ssize_t w = send(fd, body + off, body_len - off, 0);
+        if (w <= 0) return;
+        off += (size_t)w;
+    }
+}
+
+static void send_response(int fd, int code, const char *body) {
+    send_response_ct(fd, code, body, strlen(body), "application/json");
+}
+
+static void ep_ui(int fd) {
+    send_response_ct(fd, 200, WEB_UI_HTML, sizeof(WEB_UI_HTML) - 1,
+                     "text/html; charset=utf-8");
 }
 
 static void err_response(int fd, int code, const char *msg) {
@@ -464,9 +492,34 @@ static void ep_wp_add(int fd, const char *qs) {
     mwn->addr = addr;
     mwn->size = (int)size;
     mwn->rwi = rwi;
+    /* Optional value-match: val=HEX (must match) + valmask=HEX
+     * (defaults to 0xFFFFFFFF = full width).  Useful for catching a
+     * specific signature, e.g. val=0x20430C68 to catch the moment a
+     * relocatable image header lands at an address. */
+    char *vs = get_query_param(qs, "val");
+    char *vms = get_query_param(qs, "valmask");
     mwn->val_enabled = 0;
     mwn->val_mask = 0xFFFFFFFF;
     mwn->val = 0;
+    if (vs) {
+        char vbuf[64];
+        snprintf(vbuf, sizeof vbuf, "%s", vs);
+        int ok = 0;
+        mwn->val = parse_uint(vbuf, &ok);
+        if (!ok) { err_response(fd, 400, "bad val"); return; }
+        mwn->val_enabled = 1;
+        /* val_size is used by memwatch_func's match window; set to the
+         * watchpoint's size, max 4 bytes (longword) per the rwi check. */
+        mwn->val_size = (int)size;
+        if (mwn->val_size > 4) mwn->val_size = 4;
+        if (vms) {
+            char mbuf[64];
+            snprintf(mbuf, sizeof mbuf, "%s", vms);
+            ok = 0;
+            mwn->val_mask = parse_uint(mbuf, &ok);
+            if (!ok) { err_response(fd, 400, "bad valmask"); return; }
+        }
+    }
     /* MW_MASK_ALL covers every access source — CPU read/write/instr fetch,
      * blitter A/B/C/D, copper, disk, audio, bitplane, sprite.  Required —
      * a watchpoint with access_mask=0 never fires. */
@@ -811,6 +864,452 @@ static void ep_wp_last(int fd) {
     send_response(fd, 200, body);
 }
 
+/* ----- Symbol resolution -----
+ *
+ * Static table of well-known Amiga addresses.  Covers:
+ *   - 68000 CPU exception vectors (0x000..0x0FC)
+ *   - Custom chipset registers ($DFF000..$DFF1FE)
+ *   - CIA-A / CIA-B registers ($BFE001..$BFEF01 / $BFD000..$BFDF00)
+ *   - Common Kickstart entry points + ExecBase offsets
+ *
+ * No external symbol file load yet (no .fd parsing, no symbol table
+ * upload).  This is the minimum useful baseline for navigating an
+ * Amiga debugger session. */
+
+struct sym_entry { uae_u32 addr; const char *name; const char *desc; };
+
+static const struct sym_entry SYMBOLS[] = {
+    /* 68000 vectors */
+    {0x000, "ResetSSP",   "reset supervisor stack pointer"},
+    {0x004, "ResetPC",    "reset program counter"},
+    {0x008, "BusError",   "bus error vector"},
+    {0x00C, "AddrError",  "address error vector"},
+    {0x010, "IllegalOp",  "illegal instruction vector"},
+    {0x014, "ZeroDiv",    "divide by zero vector"},
+    {0x018, "CHK",        "CHK instruction vector"},
+    {0x01C, "TRAPV",      "TRAPV instruction vector"},
+    {0x020, "Privilege",  "privilege violation vector"},
+    {0x024, "Trace",      "trace vector"},
+    {0x028, "LineA",      "LINE A unimplemented vector"},
+    {0x02C, "LineF",      "LINE F unimplemented vector"},
+    {0x060, "Spurious",   "spurious interrupt vector"},
+    {0x064, "Autovec1",   "autovec L1 (TBE/DSKBLK/SOFT)"},
+    {0x068, "Autovec2",   "autovec L2 (CIA-A / PORTS)"},
+    {0x06C, "Autovec3",   "autovec L3 (COPER/VERTB/BLIT)"},
+    {0x070, "Autovec4",   "autovec L4 (AUD0-3)"},
+    {0x074, "Autovec5",   "autovec L5 (RBF/DSKSYNC)"},
+    {0x078, "Autovec6",   "autovec L6 (CIA-B / EXTER)"},
+    {0x07C, "Autovec7",   "autovec L7 (NMI)"},
+    {0x080, "TRAP0",      "TRAP #0"},
+    {0x084, "TRAP1",      "TRAP #1"},
+    {0x088, "TRAP2",      "TRAP #2"},
+    {0x08C, "TRAP3",      "TRAP #3"},
+    {0x090, "TRAP4",      "TRAP #4"},
+    {0x094, "TRAP5",      "TRAP #5"},
+    {0x098, "TRAP6",      "TRAP #6"},
+    {0x09C, "TRAP7",      "TRAP #7"},
+    {0x0A0, "TRAP8",      "TRAP #8"},
+    {0x0A4, "TRAP9",      "TRAP #9"},
+    {0x0A8, "TRAP10",     "TRAP #10"},
+    {0x0AC, "TRAP11",     "TRAP #11"},
+    {0x0B0, "TRAP12",     "TRAP #12"},
+    {0x0B4, "TRAP13",     "TRAP #13"},
+    {0x0B8, "TRAP14",     "TRAP #14"},
+    {0x0BC, "TRAP15",     "TRAP #15"},
+
+    /* Exec lowmem */
+    {0x0004, "ExecBase*", "pointer to ExecBase"},
+
+    /* Custom chipset — read registers */
+    {0xDFF000, "BLTDDAT",   "blitter dest early read"},
+    {0xDFF002, "DMACONR",   "DMA control read"},
+    {0xDFF004, "VPOSR",     "raster pos high"},
+    {0xDFF006, "VHPOSR",    "raster pos low"},
+    {0xDFF008, "DSKDATR",   "disk data early read"},
+    {0xDFF00A, "JOY0DAT",   "joystick 0 read"},
+    {0xDFF00C, "JOY1DAT",   "joystick 1 read"},
+    {0xDFF00E, "CLXDAT",    "collision data read"},
+    {0xDFF010, "ADKCONR",   "audio/disk control read"},
+    {0xDFF012, "POT0DAT",   "pot 0 read"},
+    {0xDFF014, "POT1DAT",   "pot 1 read"},
+    {0xDFF016, "POTGOR",    "pot port read"},
+    {0xDFF018, "SERDATR",   "serial data read"},
+    {0xDFF01A, "DSKBYTR",   "disk byte read"},
+    {0xDFF01C, "INTENAR",   "interrupt enable read"},
+    {0xDFF01E, "INTREQR",   "interrupt request read"},
+    /* Custom chipset — write registers */
+    {0xDFF020, "DSKPT",     "disk DMA pointer (high)"},
+    {0xDFF024, "DSKLEN",    "disk length / DMA enable"},
+    {0xDFF026, "DSKDAT",    "disk data write"},
+    {0xDFF028, "REFPTR",    "refresh pointer"},
+    {0xDFF02A, "VPOSW",     "raster pos high write"},
+    {0xDFF02C, "VHPOSW",    "raster pos low write"},
+    {0xDFF02E, "COPCON",    "copper control"},
+    {0xDFF030, "SERDAT",    "serial data write"},
+    {0xDFF032, "SERPER",    "serial period"},
+    {0xDFF034, "POTGO",     "pot start"},
+    {0xDFF036, "JOYTEST",   "joystick test"},
+    {0xDFF080, "COP1LCH",   "copper list 1 high"},
+    {0xDFF082, "COP1LCL",   "copper list 1 low"},
+    {0xDFF084, "COP2LCH",   "copper list 2 high"},
+    {0xDFF086, "COP2LCL",   "copper list 2 low"},
+    {0xDFF088, "COPJMP1",   "trigger copper list 1"},
+    {0xDFF08A, "COPJMP2",   "trigger copper list 2"},
+    {0xDFF08E, "DIWSTRT",   "display window start"},
+    {0xDFF090, "DIWSTOP",   "display window stop"},
+    {0xDFF092, "DDFSTRT",   "data fetch start"},
+    {0xDFF094, "DDFSTOP",   "data fetch stop"},
+    {0xDFF096, "DMACON",    "DMA control write"},
+    {0xDFF098, "CLXCON",    "collision control"},
+    {0xDFF09A, "INTENA",    "interrupt enable write"},
+    {0xDFF09C, "INTREQ",    "interrupt request write"},
+    {0xDFF09E, "ADKCON",    "audio/disk control write"},
+    /* Audio channels */
+    {0xDFF0A0, "AUD0LCH",   "audio 0 location high"},
+    {0xDFF0A2, "AUD0LCL",   "audio 0 location low"},
+    {0xDFF0A4, "AUD0LEN",   "audio 0 length"},
+    {0xDFF0A6, "AUD0PER",   "audio 0 period"},
+    {0xDFF0A8, "AUD0VOL",   "audio 0 volume"},
+    /* Bitplane pointers */
+    {0xDFF0E0, "BPL1PTH",   "bitplane 1 pointer high"},
+    {0xDFF0E2, "BPL1PTL",   "bitplane 1 pointer low"},
+    {0xDFF0E4, "BPL2PTH",   "bitplane 2 pointer high"},
+    {0xDFF0E8, "BPL3PTH",   "bitplane 3 pointer high"},
+    {0xDFF0EC, "BPL4PTH",   "bitplane 4 pointer high"},
+    {0xDFF0F0, "BPL5PTH",   "bitplane 5 pointer high"},
+    {0xDFF0F4, "BPL6PTH",   "bitplane 6 pointer high"},
+    {0xDFF100, "BPLCON0",   "bitplane control 0"},
+    {0xDFF102, "BPLCON1",   "bitplane control 1"},
+    {0xDFF104, "BPLCON2",   "bitplane control 2"},
+    {0xDFF108, "BPL1MOD",   "bitplane 1 modulo"},
+    {0xDFF10A, "BPL2MOD",   "bitplane 2 modulo"},
+    /* Blitter */
+    {0xDFF040, "BLTCON0",   "blitter control 0"},
+    {0xDFF042, "BLTCON1",   "blitter control 1"},
+    {0xDFF044, "BLTAFWM",   "blitter A first-word mask"},
+    {0xDFF046, "BLTALWM",   "blitter A last-word mask"},
+    {0xDFF048, "BLTCPTH",   "blitter C pointer high"},
+    {0xDFF04A, "BLTCPTL",   "blitter C pointer low"},
+    {0xDFF04C, "BLTBPTH",   "blitter B pointer high"},
+    {0xDFF050, "BLTAPTH",   "blitter A pointer high"},
+    {0xDFF054, "BLTDPTH",   "blitter D pointer high"},
+    {0xDFF058, "BLTSIZE",   "blitter size / start"},
+    {0xDFF060, "BLTCMOD",   "blitter C modulo"},
+    {0xDFF062, "BLTBMOD",   "blitter B modulo"},
+    {0xDFF064, "BLTAMOD",   "blitter A modulo"},
+    {0xDFF066, "BLTDMOD",   "blitter D modulo"},
+    {0xDFF070, "BLTCDAT",   "blitter C data"},
+    {0xDFF072, "BLTBDAT",   "blitter B data"},
+    {0xDFF074, "BLTADAT",   "blitter A data"},
+    /* Color registers */
+    {0xDFF180, "COLOR00",   "color 0 (background)"},
+    {0xDFF182, "COLOR01",   "color 1"},
+    {0xDFF184, "COLOR02",   "color 2"},
+    {0xDFF186, "COLOR03",   "color 3"},
+    /* CIA-A */
+    {0xBFE001, "ciaa_pra",  "CIA-A port A (LED, OVL, disk control)"},
+    {0xBFE101, "ciaa_prb",  "CIA-A port B (parallel)"},
+    {0xBFE201, "ciaa_ddra", "CIA-A DDR port A"},
+    {0xBFE301, "ciaa_ddrb", "CIA-A DDR port B"},
+    {0xBFE401, "ciaa_ta_lo","CIA-A timer A lo"},
+    {0xBFE501, "ciaa_ta_hi","CIA-A timer A hi"},
+    {0xBFE601, "ciaa_tb_lo","CIA-A timer B lo"},
+    {0xBFE701, "ciaa_tb_hi","CIA-A timer B hi"},
+    {0xBFE801, "ciaa_e_lo", "CIA-A TOD event lo"},
+    {0xBFE901, "ciaa_e_mid","CIA-A TOD event mid"},
+    {0xBFEA01, "ciaa_e_hi", "CIA-A TOD event hi"},
+    {0xBFEC01, "ciaa_sdr",  "CIA-A serial data (keyboard)"},
+    {0xBFED01, "ciaa_icr",  "CIA-A IRQ control / read"},
+    {0xBFEE01, "ciaa_cra",  "CIA-A control reg A"},
+    {0xBFEF01, "ciaa_crb",  "CIA-A control reg B"},
+    /* CIA-B */
+    {0xBFD000, "ciab_pra",  "CIA-B port A (serial RTS/DTR/CD)"},
+    {0xBFD100, "ciab_prb",  "CIA-B port B (motor/sel/side/step/dir)"},
+    {0xBFD200, "ciab_ddra", "CIA-B DDR port A"},
+    {0xBFD300, "ciab_ddrb", "CIA-B DDR port B"},
+    {0xBFD400, "ciab_ta_lo","CIA-B timer A lo"},
+    {0xBFD500, "ciab_ta_hi","CIA-B timer A hi"},
+    {0xBFDC00, "ciab_sdr",  "CIA-B serial data"},
+    {0xBFDD00, "ciab_icr",  "CIA-B IRQ control / read"},
+    {0xBFDE00, "ciab_cra",  "CIA-B control reg A"},
+    {0xBFDF00, "ciab_crb",  "CIA-B control reg B"},
+};
+
+static const char *symbol_for_addr(uae_u32 addr) {
+    for (size_t i = 0; i < sizeof SYMBOLS / sizeof SYMBOLS[0]; i++) {
+        if (SYMBOLS[i].addr == addr) return SYMBOLS[i].name;
+    }
+    return NULL;
+}
+
+static void ep_sym_lookup(int fd, const char *qs) {
+    char *as = get_query_param(qs, "addr");
+    if (!as) { err_response(fd, 400, "missing addr"); return; }
+    char addr_buf[64];
+    snprintf(addr_buf, sizeof addr_buf, "%s", as);
+    int ok = 0;
+    uae_u32 addr = parse_uint(addr_buf, &ok);
+    if (!ok) { err_response(fd, 400, "bad addr"); return; }
+    const char *name = NULL;
+    const char *desc = NULL;
+    for (size_t i = 0; i < sizeof SYMBOLS / sizeof SYMBOLS[0]; i++) {
+        if (SYMBOLS[i].addr == addr) {
+            name = SYMBOLS[i].name;
+            desc = SYMBOLS[i].desc;
+            break;
+        }
+    }
+    char body[512];
+    if (name) {
+        snprintf(body, sizeof body,
+            "{\"ok\":true,\"addr\":\"0x%08x\",\"name\":\"%s\",\"desc\":\"%s\"}\n",
+            (unsigned)addr, name, desc ? desc : "");
+    } else {
+        snprintf(body, sizeof body,
+            "{\"ok\":true,\"addr\":\"0x%08x\",\"name\":null}\n",
+            (unsigned)addr);
+    }
+    send_response(fd, 200, body);
+}
+
+static void ep_sym_list(int fd) {
+    static char body[16384];
+    int n = snprintf(body, sizeof body, "{\"ok\":true,\"symbols\":[");
+    for (size_t i = 0; i < sizeof SYMBOLS / sizeof SYMBOLS[0]; i++) {
+        n += snprintf(body + n, sizeof body - n,
+            "%s{\"addr\":\"0x%08x\",\"name\":\"%s\",\"desc\":\"%s\"}",
+            i ? "," : "",
+            (unsigned)SYMBOLS[i].addr,
+            SYMBOLS[i].name,
+            SYMBOLS[i].desc);
+        if (n >= (int)sizeof body - 256) break;
+    }
+    n += snprintf(body + n, sizeof body - n, "]}\n");
+    send_response(fd, 200, body);
+}
+
+/* ===== WebSocket event stream =====
+ *
+ * On WS upgrade the connection becomes a push channel.  A background
+ * pulse thread polls debugger_active + memwatch_triggered every 50 ms;
+ * when state changes, a JSON frame is pushed to all connected clients.
+ *
+ * Frame shape:
+ *   {"event":"paused"  , "pc":"0x..", "reason":"user|wp|bp|step"}
+ *   {"event":"running" }
+ *   {"event":"wp_hit"  , "addr":"0x..", "pc":"0x..", "value":"0x.."}
+ *
+ * We keep a tiny array of connected client fds (max 8) protected by a
+ * mutex.  No backpressure handling — slow clients get their frames
+ * dropped silently. */
+
+#include <pthread.h>
+
+#define WS_MAX_CLIENTS 8
+static int ws_clients[WS_MAX_CLIENTS];
+static pthread_mutex_t ws_lock = PTHREAD_MUTEX_INITIALIZER;
+static int ws_pulse_started = 0;
+
+/* ----- Base64 + SHA-1 for the WebSocket handshake key ----- */
+
+static const char *B64 =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static void b64_encode(const uint8_t *in, int n, char *out) {
+    int o = 0;
+    for (int i = 0; i < n; i += 3) {
+        uint32_t b = ((uint32_t)in[i] << 16);
+        if (i + 1 < n) b |= ((uint32_t)in[i + 1] << 8);
+        if (i + 2 < n) b |= ((uint32_t)in[i + 2]);
+        out[o++] = B64[(b >> 18) & 0x3F];
+        out[o++] = B64[(b >> 12) & 0x3F];
+        out[o++] = (i + 1 < n) ? B64[(b >> 6) & 0x3F] : '=';
+        out[o++] = (i + 2 < n) ? B64[b & 0x3F]       : '=';
+    }
+    out[o] = 0;
+}
+
+/* Minimal SHA-1.  Tiny self-contained — only used for the WebSocket
+ * accept-key computation, never in any hot path. */
+static void sha1_be32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);  p[3] = (uint8_t)(v);
+}
+static uint32_t sha1_rol(uint32_t x, int n) { return (x << n) | (x >> (32 - n)); }
+static void sha1(const uint8_t *msg, size_t len, uint8_t out[20]) {
+    uint32_t h[5] = {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0};
+    size_t padded = ((len + 9 + 63) / 64) * 64;
+    uint8_t *buf = (uint8_t *)calloc(1, padded);
+    memcpy(buf, msg, len);
+    buf[len] = 0x80;
+    uint64_t bitlen = (uint64_t)len * 8;
+    for (int i = 0; i < 8; i++) buf[padded - 1 - i] = (uint8_t)(bitlen >> (i * 8));
+    for (size_t off = 0; off < padded; off += 64) {
+        uint32_t w[80];
+        for (int i = 0; i < 16; i++) {
+            w[i] = ((uint32_t)buf[off + i*4] << 24)
+                 | ((uint32_t)buf[off + i*4 + 1] << 16)
+                 | ((uint32_t)buf[off + i*4 + 2] << 8)
+                 | ((uint32_t)buf[off + i*4 + 3]);
+        }
+        for (int i = 16; i < 80; i++)
+            w[i] = sha1_rol(w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16], 1);
+        uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
+        for (int i = 0; i < 80; i++) {
+            uint32_t f, k;
+            if      (i < 20) { f = (b & c) | ((~b) & d); k = 0x5A827999; }
+            else if (i < 40) { f = b ^ c ^ d;             k = 0x6ED9EBA1; }
+            else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
+            else             { f = b ^ c ^ d;             k = 0xCA62C1D6; }
+            uint32_t t = sha1_rol(a, 5) + f + e + k + w[i];
+            e = d; d = c; c = sha1_rol(b, 30); b = a; a = t;
+        }
+        h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e;
+    }
+    free(buf);
+    for (int i = 0; i < 5; i++) sha1_be32(out + i*4, h[i]);
+}
+
+/* Returns -1 if the send hits a broken pipe (so callers can evict the
+ * client).  We use MSG_NOSIGNAL on Linux; macOS sets SO_NOSIGPIPE per
+ * socket and treats EPIPE as a normal errno.  Either way SIGPIPE never
+ * kills the process. */
+#ifndef MSG_NOSIGNAL
+# define MSG_NOSIGNAL 0
+#endif
+
+static int ws_send_frame(int fd, const char *msg) {
+    size_t n = strlen(msg);
+    uint8_t hdr[10];
+    int hlen;
+    hdr[0] = 0x81;  /* FIN + text */
+    if (n < 126) {
+        hdr[1] = (uint8_t)n;
+        hlen = 2;
+    } else if (n < 65536) {
+        hdr[1] = 126;
+        hdr[2] = (uint8_t)(n >> 8);
+        hdr[3] = (uint8_t)n;
+        hlen = 4;
+    } else {
+        hdr[1] = 127;
+        for (int i = 0; i < 8; i++) hdr[2 + i] = (uint8_t)(n >> ((7 - i) * 8));
+        hlen = 10;
+    }
+    if (send(fd, hdr, hlen, MSG_NOSIGNAL) <= 0) return -1;
+    if (send(fd, msg, n, MSG_NOSIGNAL) <= 0) return -1;
+    return 0;
+}
+
+static void ws_broadcast(const char *msg) {
+    pthread_mutex_lock(&ws_lock);
+    for (int i = 0; i < WS_MAX_CLIENTS; i++) {
+        if (ws_clients[i] >= 0) {
+            if (ws_send_frame(ws_clients[i], msg) < 0) {
+                close(ws_clients[i]);
+                ws_clients[i] = -1;
+            }
+        }
+    }
+    pthread_mutex_unlock(&ws_lock);
+}
+
+static void *ws_pulse_thread(void *unused) {
+    (void)unused;
+    int last_active = -1;
+    int last_trig = -1;
+    for (;;) {
+        usleep(50000);  /* 50 ms */
+        if (debugger_active != last_active) {
+            char buf[256];
+            if (debugger_active) {
+                const char *reason = "user";
+                if (memwatch_triggered) reason = "wp";
+                else if (skipaddr_doskip > 0) reason = "step";
+                snprintf(buf, sizeof buf,
+                    "{\"event\":\"paused\",\"pc\":\"0x%08x\",\"reason\":\"%s\"}\n",
+                    (unsigned)m68k_getpc(), reason);
+            } else {
+                snprintf(buf, sizeof buf, "{\"event\":\"running\"}\n");
+            }
+            ws_broadcast(buf);
+            last_active = debugger_active;
+        }
+        if (memwatch_triggered != last_trig && memwatch_triggered > 0) {
+            char buf[512];
+            snprintf(buf, sizeof buf,
+                "{\"event\":\"wp_hit\",\"slot\":%d,\"addr\":\"0x%08x\","
+                "\"pc\":\"0x%08x\",\"value\":\"0x%08x\"}\n",
+                memwatch_triggered - 1,
+                (unsigned)mwhit.addr, (unsigned)mwhit.pc, (unsigned)mwhit.val);
+            ws_broadcast(buf);
+            last_trig = memwatch_triggered;
+        }
+    }
+    return NULL;
+}
+
+static void ws_add_client(int fd) {
+#ifdef SO_NOSIGPIPE
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+#endif
+    pthread_mutex_lock(&ws_lock);
+    int slot = -1;
+    for (int i = 0; i < WS_MAX_CLIENTS; i++) {
+        if (ws_clients[i] < 0) { ws_clients[i] = fd; slot = i; break; }
+    }
+    pthread_mutex_unlock(&ws_lock);
+    if (slot < 0) close(fd);
+    /* Start the pulse thread on first client.  Idempotent. */
+    if (!ws_pulse_started) {
+        ws_pulse_started = 1;
+        pthread_t t;
+        pthread_create(&t, NULL, ws_pulse_thread, NULL);
+        pthread_detach(t);
+    }
+}
+
+/* ----- /v1/events upgrade handler -----
+ * Looks for Sec-WebSocket-Key in the raw request, computes the magic
+ * SHA-1 + base64 of (key + WS magic GUID), sends the upgrade response,
+ * then registers the fd as a push client. */
+
+static void ep_events_upgrade(int fd, const char *raw) {
+    const char *k = strstr(raw, "Sec-WebSocket-Key:");
+    if (!k) { err_response(fd, 400, "missing ws key"); return; }
+    k += 18;
+    while (*k == ' ' || *k == '\t') k++;
+    char key[128];
+    int kn = 0;
+    while (*k && *k != '\r' && *k != '\n' && kn < (int)sizeof key - 1)
+        key[kn++] = *k++;
+    key[kn] = 0;
+    /* Concatenate with the WebSocket GUID, SHA-1, base64. */
+    static const char GUID[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    char concat[256];
+    snprintf(concat, sizeof concat, "%s%s", key, GUID);
+    uint8_t hash[20];
+    sha1((const uint8_t *)concat, strlen(concat), hash);
+    char accept_b64[40];
+    b64_encode(hash, 20, accept_b64);
+    char hdr[512];
+    snprintf(hdr, sizeof hdr,
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Accept: %s\r\n"
+        "\r\n", accept_b64);
+    send_str(fd, hdr);
+    ws_add_client(fd);
+    /* Send a hello frame immediately so the client knows the channel is live. */
+    char hello[128];
+    snprintf(hello, sizeof hello,
+        "{\"event\":\"hello\",\"service\":\"fs-uae-rpc v1\",\"state\":\"%s\"}\n",
+        debugger_active ? "paused" : "running");
+    ws_send_frame(fd, hello);
+}
+
 static void ep_state_load(int fd, const char *qs) {
     char *path = get_query_param(qs, "path");
     if (!path || !*path) { err_response(fd, 400, "missing path"); return; }
@@ -830,7 +1329,9 @@ static void ep_state_load(int fd, const char *qs) {
 /* ----- Request parser + dispatcher ----- */
 
 static void handle_request(int fd) {
-    char buf[2048];
+    /* Bigger buffer than original — needed for WebSocket upgrade headers
+     * which include a Sec-WebSocket-Key plus various browser baggage. */
+    char buf[4096];
     ssize_t rd = recv(fd, buf, sizeof buf - 1, 0);
     if (rd <= 0) { close(fd); return; }
     buf[rd] = '\0';
@@ -841,12 +1342,30 @@ static void handle_request(int fd) {
         close(fd);
         return;
     }
+    /* WebSocket upgrade: GET /v1/events with Upgrade: websocket */
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/events") == 0 &&
+        strstr(buf, "Upgrade: websocket")) {
+        ep_events_upgrade(fd, buf);
+        /* Don't close fd — it's the push channel now. */
+        return;
+    }
     /* Split path / query. */
     char *qs = strchr(path, '?');
     if (qs) { *qs = '\0'; qs++; }
 
+    /* CORS preflight handling — any OPTIONS request returns 200 with
+     * the CORS headers already in send_response_ct.                    */
+    if (strcmp(method, "OPTIONS") == 0) {
+        send_response_ct(fd, 200, "", 0, "text/plain");
+        close(fd);
+        return;
+    }
+
     /* Dispatch. */
-    if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/ping") == 0) {
+    if ((strcmp(method, "GET") == 0) &&
+        (strcmp(path, "/") == 0 || strcmp(path, "/v1/ui") == 0)) {
+        ep_ui(fd);
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/ping") == 0) {
         ep_ping(fd);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/state") == 0) {
         ep_run_state(fd);
@@ -891,6 +1410,10 @@ static void handle_request(int fd) {
         ep_custom(fd);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/state/load") == 0) {
         ep_state_load(fd, qs);
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/symbols") == 0) {
+        ep_sym_list(fd);
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/symbols/lookup") == 0) {
+        ep_sym_lookup(fd, qs);
     } else {
         err_response(fd, 404, "no such endpoint");
     }
@@ -941,6 +1464,13 @@ static void *rpc_worker(void *arg) {
 /* ----- Public init (called from FS-UAE startup) ----- */
 
 extern "C" void fsuae_rpc_init(void) {
+    /* Ignore SIGPIPE — broken client connections would otherwise kill
+     * the entire emulator process.  We rely on send() returning EPIPE. */
+    signal(SIGPIPE, SIG_IGN);
+
+    /* Init the websocket-client slot array — -1 means "free". */
+    for (int i = 0; i < WS_MAX_CLIENTS; i++) ws_clients[i] = -1;
+
     const char *env = getenv("FSUAE_RPC_PORT");
     if (!env || !*env) return; /* disabled */
     int port = atoi(env);
