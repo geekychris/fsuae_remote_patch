@@ -10,6 +10,37 @@ index 234a66e3..61c9f710 100644
  	src/def_icons.cpp \
  	src/devices.cpp \
  	src/disk.cpp \
+diff --git a/src/debug.cpp b/src/debug.cpp
+index 18cb5e0b..0c70bcc2 100644
+--- a/src/debug.cpp
++++ b/src/debug.cpp
+@@ -2320,7 +2320,7 @@ static void smc_free (void)
+ 	smc_table = NULL;
+ }
+ 
+-static void initialize_memwatch (int mode);
++void initialize_memwatch (int mode);
+ static void smc_detect_init (TCHAR **c)
+ {
+ 	int v, i;
+@@ -2914,7 +2914,7 @@ static void memwatch_remap (uaecptr addr)
+ 	}
+ }
+ 
+-static void memwatch_setup (void)
++void memwatch_setup (void)
+ {
+ 	memwatch_reset ();
+ 	for (int i = 0; i < MEMWATCH_TOTAL; i++) {
+@@ -2950,7 +2950,7 @@ static int deinitialize_memwatch (void)
+ 	return oldmode;
+ }
+ 
+-static void initialize_memwatch (int mode)
++void initialize_memwatch (int mode)
+ {
+ 	membank_total = currprefs.address_space_24 ? 256 : 65536;
+ 	deinitialize_memwatch ();
 diff --git a/src/main.cpp b/src/main.cpp
 index 7040dfe4..59e16624 100644
 --- a/src/main.cpp

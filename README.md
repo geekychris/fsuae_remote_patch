@@ -82,14 +82,27 @@ Each endpoint is a thin wrapper around an existing internal FS-UAE function:
 | Endpoint | Wraps |
 |---|---|
 | `GET /v1/ping` | — |
+| `GET /v1/state` | `debugger_active` (poll for BP/WP hits after resume) |
 | `GET /v1/cpu` | `m68k_getpc()`, `regs.regs[0..15]`, `regs.sr`, `regs.usp`, `regs.isp` |
 | `GET /v1/mem?addr&len` | `get_byte_debug()` — the same byte-read the in-process debugger uses |
 | `POST /v1/pause` | `activate_debugger()` |
 | `POST /v1/resume` | `deactivate_debugger()` |
 | `POST /v1/state/save?path` | `save_state()` |
+| `POST /v1/reset?hard=0\|1` | `uae_reset()` |
+| `POST /v1/breakpoints?addr` | writes `bpnodes[]` directly |
+| `GET /v1/breakpoints` | reads `bpnodes[]` |
+| `POST /v1/breakpoints/clear` | clears all `bpnodes[]` |
+| `POST /v1/watchpoints?addr&size&rwi` | writes `mwnodes[]` + `memwatch_setup()` |
+| `GET /v1/watchpoints` | reads `mwnodes[]` |
+| `POST /v1/watchpoints/clear` | clears all `mwnodes[]` |
 
-Total added: one C++ file (~325 lines), one `extern "C"` declaration, one
-function call. No new external dependencies.
+The patch also un-`static`s `memwatch_setup()` and `initialize_memwatch()`
+in `debug.cpp` so the RPC can install watchpoints without going through
+the in-process console command parser.
+
+Total added: one C++ file (~450 lines), one `extern "C"` declaration,
+one function call, and two `static`→non-`static` changes. No new
+external dependencies.
 
 ## Build dependencies
 
@@ -114,6 +127,7 @@ install them manually first (Debian/Ubuntu names shown):
 | Env var | Default | Meaning |
 |---|---|---|
 | `FSUAE_RPC_PORT` | *(unset)* | Port to listen on. Unset → RPC disabled. |
+| `FSUAE_RPC_PAUSE_AT_BOOT` | *(unset)* | `1` → emulator starts paused (lets you install breakpoints/watchpoints before any instruction runs). |
 | `FSUAE_SRC` | `/tmp/fsuae-src` | Where `build.sh` clones FS-UAE source. |
 | `FSUAE_TAG` | `v3.2.35` | Which FS-UAE tag to build. |
 | `FSUAE_URL` | `https://github.com/FrodeSolheim/fs-uae.git` | Source repo to clone. |
@@ -142,15 +156,17 @@ build system; the patch will need to be adapted.
 - 127.0.0.1 only. There is no auth. Don't expose the port externally; if
   you must, put it behind an SSH tunnel.
 
-## Roadmap (v2)
+## Roadmap
 
-See [docs/ROADMAP.md](docs/ROADMAP.md). Headline items:
+Already landed in this release: breakpoints, watchpoints, reset,
+state polling, pause-at-boot. See [docs/ROADMAP.md](docs/ROADMAP.md)
+for what's next:
 
-- PC + memory breakpoints with auto-pause
-- Single-step
-- Memory write
-- Register write
-- State load
+- Single-step (`/v1/step`)
+- Memory write (`POST /v1/mem`)
+- Register write (`POST /v1/cpu/d0` etc.)
+- State load (`POST /v1/state/load`)
+- Debugger command pass-through (`POST /v1/debug?cmd=`)
 - WebSocket event stream (notify on breakpoint hit)
 - Windows port (currently compiles to a no-op stub on Win32)
 

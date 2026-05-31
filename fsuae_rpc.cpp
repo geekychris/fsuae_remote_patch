@@ -25,11 +25,20 @@
  *
  * v1 endpoints:
  *     GET  /v1/ping                        smoke test — returns {"ok":true}
+ *     GET  /v1/state                       running/paused (poll for BP/WP hits)
  *     GET  /v1/cpu                         CPU registers + PC + SR
  *     GET  /v1/mem?addr=HEX&len=N          read N bytes from addr, hex string
  *     POST /v1/pause                       activate_debugger (stop the emu)
  *     POST /v1/resume                      deactivate_debugger (resume)
  *     POST /v1/state/save?path=ABS_PATH    save state to absolute path
+ *     POST /v1/breakpoints?addr=HEX        install PC breakpoint, auto-pause on hit
+ *     GET  /v1/breakpoints                 list active breakpoints
+ *     POST /v1/breakpoints/clear           remove all breakpoints
+ *     POST /v1/watchpoints?addr=HEX&size=N&rwi=W
+ *                                          install memory watchpoint (rwi = R|W|RW)
+ *     GET  /v1/watchpoints                 list active watchpoints
+ *     POST /v1/watchpoints/clear           remove all watchpoints
+ *     POST /v1/reset?hard=1                trigger reset (hard=1 default, 0=soft)
  *
  * Conventions:
  *     - addr/len query params accept decimal or 0x-prefixed hex (or $-hex)
@@ -38,7 +47,6 @@
  *
  * Not in v1 (deferred — see ROADMAP.md):
  *     - WebSocket event stream (notify on breakpoint hit)
- *     - PC breakpoints with auto-pause
  *     - Single-step
  *     - Memory write
  *     - Register write
@@ -55,6 +63,13 @@
 #include "newcpu.h"
 #include "debug.h"
 #include "savestate.h"
+#include "uae.h"
+
+/* The patch un-statics these so we can drive memwatch installation
+ * without re-entering the in-process debugger command parser.
+ * Defined in debug.cpp (C++ linkage); declared here to match. */
+void memwatch_setup(void);
+void initialize_memwatch(int mode);
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -235,6 +250,187 @@ static void ep_state_save(int fd, const char *qs) {
     }
 }
 
+/* ----- Run-state + breakpoint/watchpoint endpoints ----- */
+
+static void ep_run_state(int fd) {
+    /* debugger_active = 1 when paused (either by /v1/pause or because a
+     * BP/WP fired and FS-UAE auto-paused).  Poll this after resume to
+     * detect a BP/WP hit. */
+    char body[128];
+    snprintf(body, sizeof body,
+        "{\"ok\":true,\"state\":\"%s\"}\n",
+        debugger_active ? "paused" : "running");
+    send_response(fd, 200, body);
+}
+
+static void ep_bp_list(int fd) {
+    char body[4096];
+    int n = snprintf(body, sizeof body, "{\"ok\":true,\"breakpoints\":[");
+    int first = 1;
+    for (int i = 0; i < BREAKPOINT_TOTAL; i++) {
+        if (!bpnodes[i].enabled) continue;
+        n += snprintf(body + n, sizeof body - n,
+            "%s{\"slot\":%d,\"addr\":\"0x%08x\"}",
+            first ? "" : ",", i, (unsigned)bpnodes[i].addr);
+        first = 0;
+    }
+    n += snprintf(body + n, sizeof body - n, "]}\n");
+    send_response(fd, 200, body);
+}
+
+static void ep_bp_add(int fd, const char *qs) {
+    char *as = get_query_param(qs, "addr");
+    if (!as) { err_response(fd, 400, "missing addr"); return; }
+    char addr_buf[64];
+    snprintf(addr_buf, sizeof addr_buf, "%s", as);
+    int ok = 0;
+    uae_u32 addr = parse_uint(addr_buf, &ok);
+    if (!ok) { err_response(fd, 400, "bad addr"); return; }
+    /* find first free slot */
+    int slot = -1;
+    for (int i = 0; i < BREAKPOINT_TOTAL; i++) {
+        if (!bpnodes[i].enabled) { slot = i; break; }
+    }
+    if (slot < 0) {
+        err_response(fd, 500, "no free breakpoint slot");
+        return;
+    }
+    bpnodes[slot].addr = addr;
+    bpnodes[slot].enabled = 1;
+    char body[256];
+    snprintf(body, sizeof body,
+        "{\"ok\":true,\"slot\":%d,\"addr\":\"0x%08x\"}\n",
+        slot, (unsigned)addr);
+    send_response(fd, 200, body);
+}
+
+static void ep_bp_clear(int fd) {
+    int cleared = 0;
+    for (int i = 0; i < BREAKPOINT_TOTAL; i++) {
+        if (bpnodes[i].enabled) {
+            bpnodes[i].enabled = 0;
+            bpnodes[i].addr = 0;
+            cleared++;
+        }
+    }
+    char body[128];
+    snprintf(body, sizeof body, "{\"ok\":true,\"cleared\":%d}\n", cleared);
+    send_response(fd, 200, body);
+}
+
+static void ep_wp_list(int fd) {
+    char body[4096];
+    int n = snprintf(body, sizeof body, "{\"ok\":true,\"watchpoints\":[");
+    int first = 1;
+    for (int i = 0; i < MEMWATCH_TOTAL; i++) {
+        if (mwnodes[i].size == 0) continue;
+        n += snprintf(body + n, sizeof body - n,
+            "%s{\"slot\":%d,\"addr\":\"0x%08x\",\"size\":%d,\"rwi\":%d}",
+            first ? "" : ",", i,
+            (unsigned)mwnodes[i].addr, mwnodes[i].size, mwnodes[i].rwi);
+        first = 0;
+    }
+    n += snprintf(body + n, sizeof body - n, "]}\n");
+    send_response(fd, 200, body);
+}
+
+static int parse_rwi(const char *s) {
+    /* FS-UAE memwatch rwi bits (from debug.cpp parser): R=1, W=2, I=4. */
+    int v = 0;
+    if (!s) return 3;  /* default: R+W */
+    for (; *s; s++) {
+        char c = (char)toupper((unsigned char)*s);
+        if      (c == 'R') v |= 1;
+        else if (c == 'W') v |= 2;
+        else if (c == 'I') v |= 4;
+        else if (c == '+' || c == ',' || c == ' ') continue;
+        else return -1;
+    }
+    return v == 0 ? 3 : v;
+}
+
+static void ep_wp_add(int fd, const char *qs) {
+    char *as = get_query_param(qs, "addr");
+    if (!as) { err_response(fd, 400, "missing addr"); return; }
+    char addr_buf[64];
+    snprintf(addr_buf, sizeof addr_buf, "%s", as);
+    char *ss = get_query_param(qs, "size");
+    char size_buf[16] = "1";
+    if (ss) snprintf(size_buf, sizeof size_buf, "%s", ss);
+    char *rs = get_query_param(qs, "rwi");
+    char rwi_buf[16] = "W";
+    if (rs) snprintf(rwi_buf, sizeof rwi_buf, "%s", rs);
+    int ok_a = 0, ok_s = 0;
+    uae_u32 addr = parse_uint(addr_buf, &ok_a);
+    uae_u32 size = parse_uint(size_buf, &ok_s);
+    if (!ok_a) { err_response(fd, 400, "bad addr"); return; }
+    if (!ok_s) { err_response(fd, 400, "bad size"); return; }
+    int rwi = parse_rwi(rwi_buf);
+    if (rwi < 0) { err_response(fd, 400, "bad rwi (use R, W, I, or combos)"); return; }
+    if (size == 0 || size > 0x1000000) {
+        err_response(fd, 400, "size out of range");
+        return;
+    }
+    /* Lazy-init memwatch subsystem on first add. */
+    initialize_memwatch(0);
+    /* find first free slot */
+    int slot = -1;
+    for (int i = 0; i < MEMWATCH_TOTAL; i++) {
+        if (mwnodes[i].size == 0) { slot = i; break; }
+    }
+    if (slot < 0) { err_response(fd, 500, "no free watchpoint slot"); return; }
+    struct memwatch_node *mwn = &mwnodes[slot];
+    mwn->addr = addr;
+    mwn->size = (int)size;
+    mwn->rwi = rwi;
+    mwn->val_enabled = 0;
+    mwn->val_mask = 0xFFFFFFFF;
+    mwn->val = 0;
+    /* MW_MASK_ALL covers every access source — CPU read/write/instr fetch,
+     * blitter A/B/C/D, copper, disk, audio, bitplane, sprite.  Required —
+     * a watchpoint with access_mask=0 never fires. */
+    mwn->access_mask = MW_MASK_ALL;
+    mwn->reg = 0xFFFFFFFF;
+    mwn->frozen = 0;
+    mwn->mustchange = 0;
+    mwn->modval = 0;
+    mwn->modval_written = 0;
+    mwn->pc = 0xFFFFFFFF;
+    memwatch_setup();
+    char body[256];
+    snprintf(body, sizeof body,
+        "{\"ok\":true,\"slot\":%d,\"addr\":\"0x%08x\",\"size\":%u,\"rwi\":%d}\n",
+        slot, (unsigned)addr, (unsigned)size, rwi);
+    send_response(fd, 200, body);
+}
+
+static void ep_wp_clear(int fd) {
+    int cleared = 0;
+    for (int i = 0; i < MEMWATCH_TOTAL; i++) {
+        if (mwnodes[i].size != 0) {
+            mwnodes[i].size = 0;
+            cleared++;
+        }
+    }
+    if (cleared > 0) memwatch_setup();
+    char body[128];
+    snprintf(body, sizeof body, "{\"ok\":true,\"cleared\":%d}\n", cleared);
+    send_response(fd, 200, body);
+}
+
+static void ep_reset(int fd, const char *qs) {
+    /* hard=1 (default) is a power-on-style reset, hard=0 is a soft reset. */
+    char *hs = get_query_param(qs, "hard");
+    int hard = 1;
+    if (hs && (hs[0] == '0' || hs[0] == 'f' || hs[0] == 'F'))
+        hard = 0;
+    uae_reset(hard, 1);
+    char body[128];
+    snprintf(body, sizeof body, "{\"ok\":true,\"reset\":\"%s\"}\n",
+        hard ? "hard" : "soft");
+    send_response(fd, 200, body);
+}
+
 /* ----- Request parser + dispatcher ----- */
 
 static void handle_request(int fd) {
@@ -256,6 +452,8 @@ static void handle_request(int fd) {
     /* Dispatch. */
     if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/ping") == 0) {
         ep_ping(fd);
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/state") == 0) {
+        ep_run_state(fd);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/cpu") == 0) {
         ep_cpu(fd);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/mem") == 0) {
@@ -266,6 +464,20 @@ static void handle_request(int fd) {
         ep_resume(fd);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/state/save") == 0) {
         ep_state_save(fd, qs);
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/breakpoints") == 0) {
+        ep_bp_list(fd);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/breakpoints") == 0) {
+        ep_bp_add(fd, qs);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/breakpoints/clear") == 0) {
+        ep_bp_clear(fd);
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/watchpoints") == 0) {
+        ep_wp_list(fd);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/watchpoints") == 0) {
+        ep_wp_add(fd, qs);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/watchpoints/clear") == 0) {
+        ep_wp_clear(fd);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/reset") == 0) {
+        ep_reset(fd, qs);
     } else {
         err_response(fd, 404, "no such endpoint");
     }
@@ -330,6 +542,16 @@ extern "C" void fsuae_rpc_init(void) {
         return;
     }
     pthread_detach(tid);
+
+    /* Optional: start paused so the client can install breakpoints /
+     * watchpoints BEFORE the emulator executes its first instruction.
+     * Useful for catching very-early-boot ROM writes (chip-RAM init,
+     * IRQ vector install, etc.). */
+    const char *pause = getenv("FSUAE_RPC_PAUSE_AT_BOOT");
+    if (pause && (pause[0] == '1' || pause[0] == 'y' || pause[0] == 'Y')) {
+        fprintf(stderr, "[fsuae-rpc] starting paused (FSUAE_RPC_PAUSE_AT_BOOT=1)\n");
+        activate_debugger();
+    }
 }
 
 #endif /* !_WIN32 */

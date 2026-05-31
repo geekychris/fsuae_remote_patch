@@ -20,145 +20,137 @@ Smoke test.
 {"ok":true,"service":"fs-uae-rpc v1"}
 ```
 
-## `GET /v1/cpu`
+## `GET /v1/state`
 
-68k CPU register snapshot.
-
-Response fields (all values are zero-padded 32-bit hex strings, SR is 16-bit):
-
-| Field | Source |
-|---|---|
-| `pc` | `m68k_getpc()` |
-| `sr` | `regs.sr & 0xFFFF` |
-| `d0`..`d7` | `regs.regs[0..7]` |
-| `a0`..`a7` | `regs.regs[8..15]` |
-| `usp` | `regs.usp` |
-| `isp` | `regs.isp` |
-
-Example:
-
-```json
-{
-  "ok":true,
-  "pc":"0x00fc0fdc","sr":"0x2000",
-  "d0":"0x00c00400","d1":"0x00000000", "...": "...",
-  "a0":"0x00c0040c","a1":"0x00c00410", "...": "...",
-  "a7":"0x00c80000",
-  "usp":"0x00c06248","isp":"0x00c80000"
-}
-```
-
-**Caveat:** A7 is the *active* stack pointer for the current mode; `usp`/`isp`
-are the saved alternates. While in supervisor mode, `a7 == isp` and `usp`
-holds the user stack you'll swap back to.
-
-For stable reads, `POST /v1/pause` first.
-
-## `GET /v1/mem?addr=HEX&len=N`
-
-Read N bytes of emulated memory starting at `addr`.
-
-Query params:
-
-| Name | Required | Default | Range |
-|---|---|---|---|
-| `addr` | yes | — | full 32-bit address space |
-| `len` | no | 64 | 1..65536 |
-
-Reads use `get_byte_debug()` — the same byte-read path the FS-UAE in-process
-debugger uses (no side effects, no I/O strobes for chipset register
-reads, no exceptions on bad addresses).
-
-Response:
-
-```json
-{
-  "ok":true,
-  "addr":"0x000000c0",
-  "len":64,
-  "hex":"00000000000000000000000000000000..."
-}
-```
-
-The `hex` field is `len * 2` lowercase hex chars (no spaces, no `0x`,
-big-endian byte order = same order as the bytes in emulated RAM).
-
-Decoding examples:
-
-```python
-import json, urllib.request
-r = json.loads(urllib.request.urlopen(
-    f"http://127.0.0.1:8765/v1/mem?addr=0xC0&len=64").read())
-data = bytes.fromhex(r["hex"])
-# data is now a 64-byte bytes object
-
-# As 16 big-endian 32-bit vectors (the 68k vector table format):
-import struct
-vectors = struct.unpack(">16I", data)
-```
-
-For stable reads, `POST /v1/pause` first.
-
-## `POST /v1/pause`
-
-Stops the emulator by calling `activate_debugger()` internally. The emulator
-will halt at the next instruction boundary.
-
-```json
-{"ok":true,"state":"paused"}
-```
-
-The response returns immediately (the debugger flag is set synchronously),
-but a few in-flight emulation cycles may complete after the response is
-sent. For tight timing, pause then wait ~10 ms before reading state.
-
-## `POST /v1/resume`
-
-Resumes emulation by calling `deactivate_debugger()`.
+Returns whether the emulator is currently paused or running. Use this
+to poll for breakpoint / watchpoint hits after `/v1/resume` — when the
+WP fires, FS-UAE auto-pauses and this flips to `"paused"`.
 
 ```json
 {"ok":true,"state":"running"}
 ```
 
+Possible values: `"running"`, `"paused"`.
+
+## `GET /v1/cpu`
+
+68k CPU register snapshot. See README for field list. For stable reads,
+`POST /v1/pause` first.
+
+## `GET /v1/mem?addr=HEX&len=N`
+
+Read N bytes (1..65536) of emulated memory. Returns hex string.
+
+## `POST /v1/pause`
+
+Stops the emulator by calling `activate_debugger()`. Returns
+`{"ok":true,"state":"paused"}`.
+
+## `POST /v1/resume`
+
+Resumes emulation by calling `deactivate_debugger()`. Returns
+`{"ok":true,"state":"running"}`.
+
 ## `POST /v1/state/save?path=ABS_PATH`
 
-Save state snapshot to disk. `path` must be an absolute path the FS-UAE
-process can write to. Produces a standard `.uss` file (the same format
-FS-UAE writes when you press F11 → save).
+Save state snapshot to disk. `path` must be absolute. Produces a
+standard `.uss` file (same format as F11 → save in the GUI).
+
+## `POST /v1/reset?hard=1|0`
+
+Trigger an emulator reset.
+
+- `hard=1` (default): power-on-style reset (RAM cleared)
+- `hard=0`: soft reset (keyboard CTRL+A+A equivalent)
+
+Note: this calls `uae_reset()` which is **async** — it sets a flag the
+main loop picks up at its next tick. After this returns, the actual
+reset takes one or more emulator frames to complete. If you're chaining
+this with watchpoints, allow ~100 ms of wallclock before polling state.
+
+## `POST /v1/breakpoints?addr=HEX`
+
+Install a PC breakpoint. The emulator pauses just before executing the
+instruction at `addr`. Up to 20 breakpoints can be active simultaneously
+(FS-UAE limit).
 
 ```json
-{"ok":true,"path":"/tmp/snap.uss"}
+{"ok":true,"slot":0,"addr":"0x00fc0234"}
 ```
 
-On failure:
+After resuming, poll `/v1/state` until `"paused"` to detect a hit.
+
+## `GET /v1/breakpoints`
+
+List currently-active breakpoints.
 
 ```json
-{"ok":false,"err":"save_state failed"}
+{"ok":true,"breakpoints":[{"slot":0,"addr":"0x00fc0234"}]}
 ```
 
-The file is typically 0.5–2 MB for a 512 KB chip + 512 KB slow A500
-configuration.
+## `POST /v1/breakpoints/clear`
+
+Remove all breakpoints.
+
+```json
+{"ok":true,"cleared":1}
+```
+
+## `POST /v1/watchpoints?addr=HEX&size=N&rwi=R|W|I|RW|RWI`
+
+Install a memory watchpoint. The emulator pauses when any access in
+range `[addr, addr+size)` matches the requested rwi (Read / Write /
+Instruction-fetch). Up to 20 watchpoints can be active.
+
+Query params:
+
+| Name | Required | Default | Notes |
+|---|---|---|---|
+| `addr` | yes | — | start of watched range |
+| `size` | no | 1 | bytes covered (`64` for 16 longwords) |
+| `rwi` | no | `RW` | any combination of R, W, I (e.g. `W`, `RW`, `RWI`) |
+
+```json
+{"ok":true,"slot":0,"addr":"0x000000c0","size":64,"rwi":2}
+```
+
+The `rwi` field in responses is the FS-UAE internal bitmask: R=1, W=2, I=4.
+
+**Behavioural note:** FS-UAE's memwatch implementation rewrites the
+memory bank dispatch table to intercept accesses. The first time you
+install any watchpoint, the system initializes itself — there may be a
+small one-time delay (~1 ms). Subsequent installs are fast.
+
+**Behavioural note 2:** A reset (`POST /v1/reset`) re-initializes the
+memory banks, which clobbers the watchpoint interception. After a reset
+you must re-issue your watchpoint installs.
+
+## `GET /v1/watchpoints`
+
+List currently-active watchpoints.
+
+## `POST /v1/watchpoints/clear`
+
+Remove all watchpoints.
 
 ## Error responses
 
-All non-success responses look like:
-
-```json
-{"ok":false,"err":"<short message>"}
-```
-
+All non-success responses look like `{"ok":false,"err":"<short message>"}`.
 Common messages:
 
 | Message | Status | Cause |
 |---|---|---|
-| `missing addr` | 400 | `/v1/mem` without `addr` query param |
-| `bad addr` | 400 | `addr` failed to parse as integer |
-| `bad len` | 400 | `len` failed to parse as integer |
-| `len out of range (1..65536)` | 400 | `len` outside allowed window |
-| `missing path` | 400 | `/v1/state/save` without `path` param |
-| `save_state failed` | 500 | `save_state()` returned 0 (disk full, bad path, …) |
-| `no such endpoint` | 404 | Unknown method/path combination |
-| `malformed` | 400 | Could not parse HTTP request line |
+| `missing addr` | 400 | required query param absent |
+| `bad addr` / `bad len` / `bad size` | 400 | numeric parse failed |
+| `bad rwi (use R, W, I, or combos)` | 400 | unknown rwi character |
+| `len out of range (1..65536)` | 400 | `/v1/mem` len bound |
+| `size out of range` | 400 | watchpoint size bound (1..16777216) |
+| `no free breakpoint slot` | 500 | 20 breakpoints already active |
+| `no free watchpoint slot` | 500 | 20 watchpoints already active |
+| `missing path` | 400 | `/v1/state/save` without `path` |
+| `save_state failed` | 500 | disk full, bad path, etc. |
+| `no such endpoint` | 404 | unknown method/path combo |
+| `malformed` | 400 | could not parse HTTP request line |
 
 ## Versioning
 
