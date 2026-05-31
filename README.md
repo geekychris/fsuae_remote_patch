@@ -28,28 +28,40 @@ behaviourally identical to upstream FS-UAE.
 ```sh
 git clone git@github.com:geekychris/fsuae_remote_patch.git
 cd fsuae_remote_patch
+
+# Build the patched fs-uae binary (one-time, ~12 s on Apple Silicon)
 ./build.sh
-# ... ~12 s on Apple Silicon ...
 
-# Launch FS-UAE with the RPC enabled
-FSUAE_RPC_PORT=8765 /tmp/fsuae-src/fs-uae ~/Documents/FS-UAE/Configurations/MyAmiga.fs-uae &
-
-# In another shell:
-curl -s http://127.0.0.1:8765/v1/ping
-# {"ok":true,"service":"fs-uae-rpc v1"}
-
-curl -sX POST http://127.0.0.1:8765/v1/pause
-curl -s http://127.0.0.1:8765/v1/cpu
-# {"ok":true,"pc":"0x00fc0fdc","sr":"0x2000","d0":"...",...,"a7":"0x00c80000",...}
-
-curl -s "http://127.0.0.1:8765/v1/mem?addr=0xC0&len=64"
-# {"ok":true,"addr":"0x000000c0","len":64,"hex":"0000000000000000..."}
-
-curl -sX POST http://127.0.0.1:8765/v1/resume
+# Launch with the web UI auto-opened in your browser
+./run.sh ~/Documents/FS-UAE/Configurations/MyAmiga.fs-uae
 ```
 
-See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the full endpoint reference
-and [`examples/`](examples/) for runnable scripts.
+That's it — you now have a full Amiga debugger in your browser at
+`http://127.0.0.1:8765/`.  Live CPU registers, disassembly with
+exec.library function-name annotations, memory hex dump, chipset
+state, point-and-click breakpoints and watchpoints.
+
+For scripting / automation:
+
+```sh
+BASE=http://127.0.0.1:8765
+curl -s $BASE/v1/ping
+# {"ok":true,"service":"fs-uae-rpc v1"}
+
+curl -sX POST $BASE/v1/pause
+curl -s $BASE/v1/cpu
+# {"ok":true,"pc":"0x00fc0fdc","sr":"0x2000",...}
+
+curl -s "$BASE/v1/mem?addr=0xC0&len=64"
+curl -sX POST $BASE/v1/resume
+```
+
+See:
+- [`docs/USAGE.md`](docs/USAGE.md) — cookbook of common workflows
+- [`docs/PROTOCOL.md`](docs/PROTOCOL.md) — full endpoint reference
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — how the patch works inside FS-UAE
+- [`docs/ROADMAP.md`](docs/ROADMAP.md) — what's next
+- [`examples/`](examples/) — runnable scripts
 
 ## What's in this repo
 

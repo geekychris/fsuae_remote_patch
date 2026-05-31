@@ -1,121 +1,118 @@
 # Roadmap
 
-Things explicitly out of v1, in rough priority order.
+What's in vs. what's not, and concrete next steps.
 
-## v2 candidates
+## Done
 
-### Single-step
+- HTTP/JSON-RPC backend (pause, resume, mem, cpu, state, reset, step)
+- Watchpoints (with mustchange + value-match filters, post-reset survival)
+- Breakpoints
+- Disassembly (with optional FD annotation)
+- Chipset register snapshot (`/v1/custom`)
+- State save / load
+- Memory write, CPU register write
+- Symbol resolution: ~140 static addresses + ~80 exec.library FD entries
+- WebSocket event stream (pause/resume/wp_hit broadcast)
+- Embedded web UI (single-file vanilla JS, no build tooling)
+- Sticky pause via patched `console_get` (works with `stdin=/dev/null`)
+- Cross-platform build script (macOS + Linux deps auto-installed)
 
-`POST /v1/step` — execute one 68k instruction and re-pause.
+## Next (small, high-impact)
 
-Implementation: wrap `debugger_step()` / similar in `src/debug.cpp`. Some
-care needed because FS-UAE's debugger drives stepping by re-entering the
-in-process command-prompt loop; we'd need a non-interactive entry point.
+These should each be 1–2 hour additions:
 
-### PC breakpoints with auto-pause
+- **`POST /v1/fd/load?path=ABS&library=NAME`** — load any `.fd` file at
+  runtime, not just the built-in exec.fd.  Would enable annotation of
+  graphics.library, intuition.library, dos.library, etc.
 
-```
-POST /v1/breakpoints?addr=HEX     install breakpoint at addr
-GET  /v1/breakpoints              list active breakpoints
-DELETE /v1/breakpoints?addr=HEX   remove breakpoint
-```
+- **Conditional breakpoints** — `POST /v1/breakpoints?addr=X&cond=...`
+  with a tiny expression language (`a0 == 0xC094D4`, `*$4 != 0`, etc.).
+  Currently you have to break unconditionally and filter client-side.
 
-Implementation: FS-UAE already has breakpoint state in `debug.cpp` —
-expose it. The trickier part is notifying the client when a breakpoint
-hits (see "event stream" below) — for a pure-polling v2 we can just
-expose a `/v1/state` endpoint that says `paused` / `running` and let
-clients poll.
+- **`/v1/breakpoints/skip?count=N`** — break only after the Nth hit.
+  For heavily-used routines like `CopyMem` where you want the 47th
+  call, not the first.
 
-### Memory write
+- **`POST /v1/exec`** — run an arbitrary 68k instruction by writing
+  opcode + operands + setting PC.  Useful for "run this function"
+  workflows without modifying memory.
 
-`POST /v1/mem?addr=HEX&hex=DEADBEEF` — write bytes from a hex string.
+- **Memory map endpoint** — `GET /v1/memmap` returns region descriptors
+  (chip / slow / fast / ROM / IO / unmapped) so frontends can render a
+  memory map at a glance.
 
-Implementation: wrap `put_byte_debug()`. Need length bounds and a
-sanity check that we're not stomping ROM (or allow it explicitly with
-`?force=1`).
+- **Step over / step out** — extend `/v1/step` with `mode=over` or
+  `mode=out` for source-level navigation.  Implementation: set a one-shot
+  BP at `PC + insn_len` (over) or stack-top (out), then resume.
 
-### Register write
+## Medium (each ~1 day)
 
-```
-POST /v1/cpu/d0?value=HEX
-POST /v1/cpu/pc?value=HEX
-```
+- **Multiple library FD support** — extend the static table to a
+  dictionary keyed by library name.  Annotator uses A6 history
+  heuristics or explicit library hint param to pick the right table.
+  Would need `MOVEA.L X(A4), A6` tracking ideally.
 
-Implementation: write into `regs.regs[i]` and update `m68k_setpc()`.
-Sanity-check by reading back. Should only be safe while paused.
+- **Hunk-format executable loader** — parse Amiga hunk binaries to
+  extract debug data (HUNK_DEBUG, source line tables).  Map PCs to
+  source files + lines for code compiled with `vasm -dwarf` or
+  `m68k-amigaos-gcc -g`.
 
-### State load
+- **Live memory viewer in the UI** — current UI fetches once per
+  user request.  Auto-refresh on emulator pause; highlight changed
+  bytes since last snapshot.
 
-`POST /v1/state/load?path=ABS_PATH`
+- **Stack walker** — `GET /v1/stack?depth=N` returns frames by
+  following the A7 / A5 chain through saved-PC + saved-A5 conventions.
+  Tricky on m68k because there's no enforced frame format, but works
+  well enough for code compiled with GCC -fno-omit-frame-pointer.
 
-Implementation: wrap `restore_state()`. Mirror image of `state/save`.
+- **Snapshot diff tooling** — given two `.uss` files, summarise which
+  memory regions and registers changed.  Useful for bisection
+  workflows.
 
-### Disassemble
+- **MCP server wrapper** — Node.js or Python MCP that exposes
+  `/v1/*` as MCP tools (`fsuae.pause`, `fsuae.read_mem`, etc.) so
+  LLM agents can drive fs-uae directly.
 
-`GET /v1/disasm?addr=HEX&n=N` — disassemble N instructions at addr.
+## Larger (each ~1 week)
 
-Implementation: FS-UAE has `m68k_disasm()` (output is normally to a
-`FILE*` for the debugger console — would need a capture variant).
+- **GDB stub** — translate GDB remote protocol to `/v1/*` so existing
+  GDB-aware tools (Eclipse, VS Code's cortex-debug, etc.) can attach.
+  Would need careful packetisation but the underlying primitives are
+  all there.
 
-### Chipset register snapshot
+- **Source-level debugging via DWARF** — parse DWARF debug info from
+  m68k-amigaos-gcc binaries, map every PC to (file, line, column).
+  Show source side-by-side in the web UI when debugging a `-g` build.
 
-`GET /v1/custom` — DMACON, INTENA, INTREQ, COPxLC, BPLxPT, etc.
+- **Time-travel debugging** — leverage FS-UAE's existing
+  `savestate_capture` to record state every N frames; expose
+  `POST /v1/state/rewind?frames=N` and `POST /v1/state/replay` to
+  navigate the timeline.
 
-Implementation: read out of `custom_storage[]` / live `dmacon`/`intena`
-globals. The set of fields is a design call; the most useful is probably
-"everything that shows up in the FS-UAE debugger's `od` (output dma)
-command".
+- **Windows port** — `claude_rpc.cpp` currently compiles to a no-op
+  stub on `_WIN32`.  Port using `_beginthreadex` + Winsock2 instead
+  of pthread + BSD sockets; the HTTP parser / endpoint logic carries
+  over unchanged.
 
-## v3 / larger features
+- **Upstream PR** — submit a polished version to
+  [FrodeSolheim/fs-uae](https://github.com/FrodeSolheim/fs-uae) so this
+  becomes a configure-time option (`./configure --enable-rpc`) rather
+  than a patch.
 
-### WebSocket event stream
+## Explicitly out of scope
 
-Connect once, get notifications:
+- Authentication / HTTPS — localhost-only by design.  If you need
+  remote access, SSH-tunnel the port.
+- Multi-emulator support — one fs-uae per port.  Multiple instances
+  trivially supported by varying `FSUAE_RPC_PORT`.
+- Browser-based emulator UI — that's a different project.  The web
+  UI here is for *debugger* operations, not gameplay.
 
-```json
-{"event":"breakpoint","addr":"0x00FC1234","pc":"0x00FC1234"}
-{"event":"paused","reason":"user"}
-{"event":"crash","vector":"0x00000010","pc":"0x00BADC0D"}
-```
+## Wishlist (no immediate plans)
 
-Implementation: significant. Needs proper WebSocket framing + a way for
-the emulation thread to signal the worker thread without deadlocks.
-Probably worth doing as a separate `/v1/events` endpoint that upgrades
-to WebSocket on `GET`.
-
-### Windows support
-
-`fsuae_rpc.cpp` currently has an `#ifdef _WIN32 → no-op stub` guard.
-A real Win32 implementation would use `_beginthreadex` + WinSock2 instead
-of `pthread` + BSD sockets. The HTTP parsing / dispatch / endpoint
-implementations are platform-neutral and would carry over unchanged.
-
-### MCP server wrapper
-
-A Node or Python MCP server that translates Model Context Protocol tool
-calls into HTTP requests, so an LLM agent (Claude Desktop, Codex CLI, …)
-can natively drive FS-UAE. The HTTP surface is intentionally simple
-enough that the MCP wrapper would be a few hundred lines.
-
-### Upstream PR
-
-Eventually submit a polished version to
-[FrodeSolheim/fs-uae](https://github.com/FrodeSolheim/fs-uae) so this is
-just a configure-time option (`./configure --enable-rpc`) instead of a
-separate patch. Probably needs:
-
-- Configure-script integration (`AC_ARG_ENABLE([rpc])`)
-- An option to make port + bind-addr configurable via FS-UAE's config
-  file rather than only the env var
-- Documentation in FS-UAE's own docs/
-
-## Not planned
-
-- **Authentication.** Localhost-only by design. If you need remote
-  access, put it behind SSH or a reverse proxy you control.
-- **HTTPS.** Same reason.
-- **Multi-client concurrency.** The emulator state is a single
-  shared resource; serialising requests at the HTTP layer is the
-  right model.
-- **Browser UI.** That's a job for a separate frontend that calls this
-  HTTP API.
+- Plugin API for custom annotators (e.g. Workbench struct decoders,
+  graphics.library BitMap visualisers).
+- Performance profiling — sample PC at intervals, build a flamegraph.
+- Disk image hex editor through the API.
+- AROS / Kickstart 3.x symbol files imported automatically.
