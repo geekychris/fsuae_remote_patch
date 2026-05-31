@@ -71,3 +71,34 @@ index 7040dfe4..59e16624 100644
  		start_program ();
  	}
  	return 0;
+diff --git a/src/od-fs/uaemisc.cpp b/src/od-fs/uaemisc.cpp
+index de3577d6..9da7dd32 100644
+--- a/src/od-fs/uaemisc.cpp
++++ b/src/od-fs/uaemisc.cpp
+@@ -112,7 +112,25 @@ int console_get_gui (TCHAR *out, int maxlen) {
+ int console_get(TCHAR *in, int maxlen) {
+     TCHAR *res = fgets(in, maxlen, stdin);
+     if (res == NULL) {
+-        return -1;
++        /* EOF / pipe closed.  Normally FS-UAE would interpret this as
++         * "exit debugger" and resume emulation.  But when driving the
++         * emulator over the fsuae_rpc HTTP/JSON-RPC interface, stdin is
++         * typically /dev/null and EOF is constant — we want the debugger
++         * to REMAIN paused until an RPC client explicitly resumes (which
++         * clears the global `debugger_active` flag we check below).
++         *
++         * Sleep a small amount to avoid spinning while the RPC client
++         * makes its decisions, then return 0 (= "empty input line") so
++         * the debugger's inner loop re-checks `debugger_active` and
++         * returns naturally when /v1/resume is called.                  */
++        extern int debugger_active;
++        if (!debugger_active) {
++            in[0] = 0;
++            return -1;  /* caller will exit on negative */
++        }
++        usleep(20000);  /* 20 ms — caps polling at ~50 Hz */
++        in[0] = 0;
++        return 0;
+     }
+     int len = strlen(in);
+     return len - 1;

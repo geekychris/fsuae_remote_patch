@@ -23,36 +23,51 @@
  *       first for stable snapshots.
  *     - /v1/pause and /v1/resume just toggle the in-process debugger.
  *
- * v1 endpoints:
+ * v1 endpoints — execution control:
  *     GET  /v1/ping                        smoke test — returns {"ok":true}
  *     GET  /v1/state                       running/paused (poll for BP/WP hits)
+ *     POST /v1/pause                       stop the emulator
+ *     POST /v1/resume                      resume emulation
+ *     POST /v1/step?n=N                    execute N instructions then pause
+ *     POST /v1/reset?hard=1                trigger reset (hard=1 default, 0=soft)
+ *
+ * v1 endpoints — inspection:
  *     GET  /v1/cpu                         CPU registers + PC + SR
  *     GET  /v1/mem?addr=HEX&len=N          read N bytes from addr, hex string
- *     POST /v1/pause                       activate_debugger (stop the emu)
- *     POST /v1/resume                      deactivate_debugger (resume)
- *     POST /v1/step?n=N                    execute N instructions then pause
+ *     GET  /v1/disasm?addr=HEX&count=N     disassemble N insns from addr
+ *     GET  /v1/custom                      Amiga chipset register snapshot
+ *
+ * v1 endpoints — mutation (paused-state recommended):
+ *     POST /v1/mem?addr=HEX&hex=BYTES      write bytes to memory
+ *     POST /v1/cpu?reg=NAME&value=HEX      write a CPU register
+ *                                          (d0..d7, a0..a7, pc, sr, usp, isp)
+ *
+ * v1 endpoints — state snapshots:
  *     POST /v1/state/save?path=ABS_PATH    save state to absolute path
+ *     POST /v1/state/load?path=ABS_PATH    restore state from path
+ *
+ * v1 endpoints — breakpoints & watchpoints:
  *     POST /v1/breakpoints?addr=HEX        install PC breakpoint, auto-pause on hit
  *     GET  /v1/breakpoints                 list active breakpoints
  *     POST /v1/breakpoints/clear           remove all breakpoints
- *     POST /v1/watchpoints?addr=HEX&size=N&rwi=W
- *                                          install memory watchpoint (rwi = R|W|RW)
+ *     POST /v1/watchpoints?addr=HEX&size=N&rwi=W&mustchange=0|1
+ *                                          install memory watchpoint
  *     GET  /v1/watchpoints                 list active watchpoints
  *     POST /v1/watchpoints/clear           remove all watchpoints
  *     POST /v1/watchpoints/rearm           re-wrap mem banks (use after /v1/reset)
- *     POST /v1/reset?hard=1                trigger reset (hard=1 default, 0=soft)
  *
  * Conventions:
- *     - addr/len query params accept decimal or 0x-prefixed hex (or $-hex)
+ *     - addr / len / value query params accept decimal, 0x-prefixed hex,
+ *       or $-prefixed hex
  *     - all responses are JSON: {"ok":true,...} or {"ok":false,"err":"msg"}
  *     - "Connection: close" — one request per TCP connection (simple v1)
  *
  * Not in v1 (deferred — see ROADMAP.md):
  *     - WebSocket event stream (notify on breakpoint hit)
- *     - Single-step
- *     - Memory write
- *     - Register write
- *     - State load
+ *     - Symbol lookup / source line mapping
+ *     - Memory map (region descriptors)
+ *     - Stack walker
+ *     - Step-over / step-out
  *     - Windows support
  */
 
@@ -66,6 +81,16 @@
 #include "debug.h"
 #include "savestate.h"
 #include "uae.h"
+
+/* External chipset state — declared here because we read them by name
+ * rather than via the chipset register memory window at $DFF000.
+ * Reading register memory at $DFF000 only returns the *readable*
+ * sub-set (DMACONR, INTREQR, INTENAR, VPOSR, VHPOSR, etc.); the live
+ * shadow state we care about (DMACON write mask, full INTENA bits, etc.)
+ * is held in these globals. */
+extern uae_u16 dmacon;
+extern uae_u16 intena, intreq;
+extern unsigned int bplcon0;
 
 /* The patch un-statics these so we can drive memwatch installation
  * and single-step without re-entering the in-process debugger command parser.
@@ -489,6 +514,275 @@ static void ep_reset(int fd, const char *qs) {
     send_response(fd, 200, body);
 }
 
+/* ----- Mutation endpoints ----- */
+
+/* Decode a hex string ("DEADBEEF" or "deadbeef") into bytes.  Returns
+ * the number of bytes decoded, or -1 on parse failure. */
+static int hex_decode(const char *s, uae_u8 *out, int max) {
+    int n = 0;
+    while (*s && n < max) {
+        char c1 = *s++;
+        if (!*s) return -1;  /* odd hex length */
+        char c2 = *s++;
+        int v1 = (c1 >= '0' && c1 <= '9') ? c1 - '0' :
+                 (c1 >= 'a' && c1 <= 'f') ? c1 - 'a' + 10 :
+                 (c1 >= 'A' && c1 <= 'F') ? c1 - 'A' + 10 : -1;
+        int v2 = (c2 >= '0' && c2 <= '9') ? c2 - '0' :
+                 (c2 >= 'a' && c2 <= 'f') ? c2 - 'a' + 10 :
+                 (c2 >= 'A' && c2 <= 'F') ? c2 - 'A' + 10 : -1;
+        if (v1 < 0 || v2 < 0) return -1;
+        out[n++] = (uae_u8)((v1 << 4) | v2);
+    }
+    return *s ? -1 : n;
+}
+
+static void ep_mem_write(int fd, const char *qs) {
+    char *as = get_query_param(qs, "addr");
+    if (!as) { err_response(fd, 400, "missing addr"); return; }
+    char addr_buf[64];
+    snprintf(addr_buf, sizeof addr_buf, "%s", as);
+    char *hs = get_query_param(qs, "hex");
+    if (!hs) { err_response(fd, 400, "missing hex"); return; }
+    char hex_buf[8192];
+    snprintf(hex_buf, sizeof hex_buf, "%s", hs);
+    int ok = 0;
+    uae_u32 addr = parse_uint(addr_buf, &ok);
+    if (!ok) { err_response(fd, 400, "bad addr"); return; }
+    static uae_u8 bytes[4096];
+    int n = hex_decode(hex_buf, bytes, sizeof bytes);
+    if (n < 0) { err_response(fd, 400, "bad hex"); return; }
+    if (n == 0) { err_response(fd, 400, "empty hex"); return; }
+    /* debug_write_memory_8 returns 1 on success, -1 on no bank.
+     * Loop one byte at a time — slower than a packed write but lets us
+     * report partial failures and works for any address range. */
+    int wrote = 0;
+    for (int i = 0; i < n; i++) {
+        if (debug_write_memory_8(addr + i, bytes[i]) == 1)
+            wrote++;
+    }
+    char body[256];
+    snprintf(body, sizeof body,
+        "{\"ok\":true,\"addr\":\"0x%08x\",\"requested\":%d,\"written\":%d}\n",
+        (unsigned)addr, n, wrote);
+    send_response(fd, 200, body);
+}
+
+/* Map a register name to a pointer into the regs struct.  Returns NULL
+ * if the name doesn't match a writable register. */
+static uae_u32 *reg_ptr_by_name(const char *name) {
+    if (!name) return NULL;
+    if (strlen(name) == 2 &&
+        (name[0] == 'd' || name[0] == 'D') &&
+         name[1] >= '0' && name[1] <= '7')
+        return &regs.regs[name[1] - '0'];
+    if (strlen(name) == 2 &&
+        (name[0] == 'a' || name[0] == 'A') &&
+         name[1] >= '0' && name[1] <= '7')
+        return &regs.regs[8 + name[1] - '0'];
+    if (!strcasecmp(name, "usp")) return &regs.usp;
+    if (!strcasecmp(name, "isp")) return &regs.isp;
+    /* PC and SR need special setters — not raw uae_u32 writes — see below */
+    return NULL;
+}
+
+static void ep_cpu_write(int fd, const char *qs) {
+    char *reg = get_query_param(qs, "reg");
+    if (!reg) { err_response(fd, 400, "missing reg"); return; }
+    char reg_buf[16];
+    snprintf(reg_buf, sizeof reg_buf, "%s", reg);
+    char *vs = get_query_param(qs, "value");
+    if (!vs) { err_response(fd, 400, "missing value"); return; }
+    char val_buf[64];
+    snprintf(val_buf, sizeof val_buf, "%s", vs);
+    int ok = 0;
+    uae_u32 value = parse_uint(val_buf, &ok);
+    if (!ok) { err_response(fd, 400, "bad value"); return; }
+
+    if (!strcasecmp(reg_buf, "pc")) {
+        m68k_setpc(value);
+        char body[160];
+        snprintf(body, sizeof body,
+            "{\"ok\":true,\"reg\":\"pc\",\"value\":\"0x%08x\"}\n",
+            (unsigned)value);
+        send_response(fd, 200, body);
+        return;
+    }
+    if (!strcasecmp(reg_buf, "sr")) {
+        regs.sr = (uae_u16)(value & 0xFFFF);
+        MakeFromSR();   /* propagate the SR bits into the CCR / mode state */
+        char body[160];
+        snprintf(body, sizeof body,
+            "{\"ok\":true,\"reg\":\"sr\",\"value\":\"0x%04x\"}\n",
+            (unsigned)(value & 0xFFFF));
+        send_response(fd, 200, body);
+        return;
+    }
+    uae_u32 *p = reg_ptr_by_name(reg_buf);
+    if (!p) { err_response(fd, 400, "unknown reg"); return; }
+    *p = value;
+    char body[160];
+    snprintf(body, sizeof body,
+        "{\"ok\":true,\"reg\":\"%s\",\"value\":\"0x%08x\"}\n",
+        reg_buf, (unsigned)value);
+    send_response(fd, 200, body);
+}
+
+/* ----- Disassembly ----- */
+
+static void ep_disasm(int fd, const char *qs) {
+    char *as = get_query_param(qs, "addr");
+    char addr_buf[64];
+    if (as) snprintf(addr_buf, sizeof addr_buf, "%s", as);
+    char *cs = get_query_param(qs, "count");
+    char count_buf[16];
+    if (cs) snprintf(count_buf, sizeof count_buf, "%s", cs);
+
+    uae_u32 addr;
+    int count = 1;
+    if (as) {
+        int ok = 0;
+        addr = parse_uint(addr_buf, &ok);
+        if (!ok) { err_response(fd, 400, "bad addr"); return; }
+    } else {
+        addr = (uae_u32)m68k_getpc();
+    }
+    if (cs) {
+        int ok = 0;
+        count = (int)parse_uint(count_buf, &ok);
+        if (!ok || count < 1 || count > 256) {
+            err_response(fd, 400, "bad count (1..256)");
+            return;
+        }
+    }
+    /* m68k_disasm_2 writes formatted text into the buffer.  Each instr is
+     * up to MAX_LINEWIDTH chars + newline.  We then split on lines and
+     * emit them as a JSON array. */
+    int bufsz = (MAX_LINEWIDTH + 4) * count;
+    TCHAR *dbuf = (TCHAR *)malloc(bufsz);
+    if (!dbuf) { err_response(fd, 500, "alloc failed"); return; }
+    uaecptr nextpc = 0;
+    m68k_disasm_2(dbuf, bufsz, addr, &nextpc, count, NULL, NULL, 1);
+
+    /* JSON-escape any backslash or quote in the disasm text.  The 68k
+     * disassembler doesn't produce control chars or non-ASCII so this is
+     * a simple pass. */
+    static char body[131072];
+    int n = snprintf(body, sizeof body,
+        "{\"ok\":true,\"addr\":\"0x%08x\",\"nextpc\":\"0x%08x\",\"lines\":[",
+        (unsigned)addr, (unsigned)nextpc);
+    int first = 1;
+    char *p = dbuf;
+    while (*p && n < (int)sizeof body - 128) {
+        char *eol = p;
+        while (*eol && *eol != '\n' && *eol != '\r') eol++;
+        if (eol == p) { p++; continue; }  /* skip blank line */
+        n += snprintf(body + n, sizeof body - n,
+            "%s\"", first ? "" : ",");
+        first = 0;
+        for (char *c = p; c < eol && n < (int)sizeof body - 8; c++) {
+            if (*c == '"' || *c == '\\') {
+                body[n++] = '\\';
+                body[n++] = *c;
+            } else if ((unsigned char)*c < 0x20) {
+                /* skip control characters (tabs get rendered as spaces) */
+                body[n++] = ' ';
+            } else {
+                body[n++] = *c;
+            }
+        }
+        n += snprintf(body + n, sizeof body - n, "\"");
+        p = eol;
+        while (*p == '\n' || *p == '\r') p++;
+    }
+    n += snprintf(body + n, sizeof body - n, "]}\n");
+    free(dbuf);
+    send_response(fd, 200, body);
+}
+
+/* ----- Chipset register snapshot ----- */
+
+static void ep_custom(int fd) {
+    /* Snapshot of the most-useful Amiga chipset registers.  We mix:
+     *   - direct reads from globals (dmacon, intena, intreq, bplcon0)
+     *   - get_word_debug() reads of the chipset register window at $DFF000
+     *     for ones with public read addresses (VPOSR, VHPOSR, ADKCON,
+     *     COPxLC, BPLxPT, etc.)
+     *
+     * This gives a frontend debugger enough state to render the Amiga's
+     * current display configuration, IRQ state, and DMA channel status. */
+    char body[4096];
+    int n = 0;
+    n += snprintf(body + n, sizeof body - n,
+        "{\"ok\":true,"
+        "\"dmacon\":\"0x%04x\","
+        "\"intena\":\"0x%04x\","
+        "\"intreq\":\"0x%04x\","
+        "\"bplcon0\":\"0x%04x\","
+        "\"vposr\":\"0x%04x\","
+        "\"vhposr\":\"0x%04x\","
+        "\"adkconr\":\"0x%04x\","
+        "\"diwstrt\":\"0x%04x\","
+        "\"diwstop\":\"0x%04x\","
+        "\"ddfstrt\":\"0x%04x\","
+        "\"ddfstop\":\"0x%04x\"",
+        (unsigned)dmacon,
+        (unsigned)intena,
+        (unsigned)intreq,
+        (unsigned)bplcon0,
+        (unsigned)(get_word_debug(0xDFF004) & 0xFFFF),
+        (unsigned)(get_word_debug(0xDFF006) & 0xFFFF),
+        (unsigned)(get_word_debug(0xDFF010) & 0xFFFF),
+        (unsigned)(get_word_debug(0xDFF08E) & 0xFFFF),
+        (unsigned)(get_word_debug(0xDFF090) & 0xFFFF),
+        (unsigned)(get_word_debug(0xDFF092) & 0xFFFF),
+        (unsigned)(get_word_debug(0xDFF094) & 0xFFFF));
+
+    /* Copper pointers — COP1LC at $080/$082, COP2LC at $084/$086.
+     * These are write-only on real hw, so reading the chipset window
+     * returns garbage; but FS-UAE's debug-read path reflects the live
+     * shadow.  In practice these come back 0xFFFF; we expose them
+     * anyway for completeness. */
+    uae_u32 cop1lc = ((uae_u32)(get_word_debug(0xDFF080) & 0xFFFF) << 16)
+                   |  (uae_u32)(get_word_debug(0xDFF082) & 0xFFFF);
+    uae_u32 cop2lc = ((uae_u32)(get_word_debug(0xDFF084) & 0xFFFF) << 16)
+                   |  (uae_u32)(get_word_debug(0xDFF086) & 0xFFFF);
+    n += snprintf(body + n, sizeof body - n,
+        ",\"cop1lc\":\"0x%08x\",\"cop2lc\":\"0x%08x\"",
+        (unsigned)cop1lc, (unsigned)cop2lc);
+
+    /* Bitplane pointers — BPLxPT at $0E0..$0F6.  Same caveat as copper. */
+    n += snprintf(body + n, sizeof body - n, ",\"bplpt\":[");
+    for (int i = 0; i < 8; i++) {
+        uae_u32 base = 0xDFF0E0 + i * 4;
+        uae_u32 ptr = ((uae_u32)(get_word_debug(base) & 0xFFFF) << 16)
+                    |  (uae_u32)(get_word_debug(base + 2) & 0xFFFF);
+        n += snprintf(body + n, sizeof body - n,
+            "%s\"0x%08x\"", i ? "," : "", (unsigned)ptr);
+    }
+    n += snprintf(body + n, sizeof body - n, "]");
+
+    n += snprintf(body + n, sizeof body - n, "}\n");
+    send_response(fd, 200, body);
+}
+
+/* ----- State load ----- */
+
+static void ep_state_load(int fd, const char *qs) {
+    char *path = get_query_param(qs, "path");
+    if (!path || !*path) { err_response(fd, 400, "missing path"); return; }
+    char path_buf[1024];
+    snprintf(path_buf, sizeof path_buf, "%s", path);
+    /* restore_state() returns void in this FS-UAE version; success is
+     * best inferred from a subsequent /v1/cpu showing the expected PC.
+     * We still surface a 200 here on the assumption that the path is
+     * valid — caller should verify. */
+    restore_state(path_buf);
+    char body[1280];
+    snprintf(body, sizeof body,
+        "{\"ok\":true,\"path\":\"%s\"}\n", path_buf);
+    send_response(fd, 200, body);
+}
+
 /* ----- Request parser + dispatcher ----- */
 
 static void handle_request(int fd) {
@@ -541,6 +835,16 @@ static void handle_request(int fd) {
         ep_wp_clear(fd);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/reset") == 0) {
         ep_reset(fd, qs);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/mem") == 0) {
+        ep_mem_write(fd, qs);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/cpu") == 0) {
+        ep_cpu_write(fd, qs);
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/disasm") == 0) {
+        ep_disasm(fd, qs);
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/custom") == 0) {
+        ep_custom(fd);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/state/load") == 0) {
+        ep_state_load(fd, qs);
     } else {
         err_response(fd, 404, "no such endpoint");
     }

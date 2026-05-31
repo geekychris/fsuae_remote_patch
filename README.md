@@ -81,28 +81,67 @@ Each endpoint is a thin wrapper around an existing internal FS-UAE function:
 
 | Endpoint | Wraps |
 |---|---|
+**Execution control**
+
+| Endpoint | Wraps |
+|---|---|
 | `GET /v1/ping` | — |
 | `GET /v1/state` | `debugger_active` (poll for BP/WP hits after resume) |
-| `GET /v1/cpu` | `m68k_getpc()`, `regs.regs[0..15]`, `regs.sr`, `regs.usp`, `regs.isp` |
-| `GET /v1/mem?addr&len` | `get_byte_debug()` — the same byte-read the in-process debugger uses |
 | `POST /v1/pause` | `activate_debugger()` |
-| `POST /v1/resume` | `deactivate_debugger()` |
-| `POST /v1/state/save?path` | `save_state()` |
+| `POST /v1/resume` | `deactivate_debugger()` + auto-rearm watchpoints |
+| `POST /v1/step?n=N` | trace-step N instructions then re-pause |
 | `POST /v1/reset?hard=0\|1` | `uae_reset()` |
+
+**Inspection**
+
+| Endpoint | Wraps |
+|---|---|
+| `GET /v1/cpu` | `m68k_getpc()`, `regs.regs[0..15]`, `regs.sr`, `regs.usp`, `regs.isp` |
+| `GET /v1/mem?addr&len` | `get_byte_debug()` — same byte-read as the in-process debugger |
+| `GET /v1/disasm?addr&count` | `m68k_disasm_2()` into JSON lines |
+| `GET /v1/custom` | DMACON, INTENA/REQ, BPLCON0, COPxLC, BPLxPT, beam pos, … |
+
+**Mutation** (pause first for safety)
+
+| Endpoint | Wraps |
+|---|---|
+| `POST /v1/mem?addr&hex` | `debug_write_memory_8()` per byte |
+| `POST /v1/cpu?reg&value` | `regs.regs[]`, `m68k_setpc()`, `MakeFromSR()` |
+
+**State snapshots**
+
+| Endpoint | Wraps |
+|---|---|
+| `POST /v1/state/save?path` | `save_state()` |
+| `POST /v1/state/load?path` | `restore_state()` |
+
+**Breakpoints & watchpoints**
+
+| Endpoint | Wraps |
+|---|---|
 | `POST /v1/breakpoints?addr` | writes `bpnodes[]` directly |
 | `GET /v1/breakpoints` | reads `bpnodes[]` |
 | `POST /v1/breakpoints/clear` | clears all `bpnodes[]` |
-| `POST /v1/watchpoints?addr&size&rwi` | writes `mwnodes[]` + `memwatch_setup()` |
+| `POST /v1/watchpoints?addr&size&rwi&mustchange` | writes `mwnodes[]` + `memwatch_setup()` |
 | `GET /v1/watchpoints` | reads `mwnodes[]` |
 | `POST /v1/watchpoints/clear` | clears all `mwnodes[]` |
+| `POST /v1/watchpoints/rearm` | force re-call of `memwatch_setup()` |
 
-The patch also un-`static`s `memwatch_setup()` and `initialize_memwatch()`
-in `debug.cpp` so the RPC can install watchpoints without going through
-the in-process console command parser.
+The patch also:
 
-Total added: one C++ file (~450 lines), one `extern "C"` declaration,
-one function call, and two `static`→non-`static` changes. No new
-external dependencies.
+- Un-`static`s `memwatch_setup()`, `initialize_memwatch()`, and
+  `skipaddr_doskip` in `debug.cpp` so the RPC can install
+  watchpoints + drive single-step without re-entering FS-UAE's
+  interactive console command parser.
+- Patches `console_get()` in `od-fs/uaemisc.cpp` to *block on stdin
+  EOF* instead of treating it as "resume". This makes `/v1/pause` and
+  watchpoint/breakpoint pauses *actually stick* when FS-UAE is launched
+  with stdin redirected from `/dev/null` (the common case for a
+  background-process driven by RPC).
+
+Total added: one new C++ file (~700 lines), one `extern "C"` decl,
+one function call, four `static`→non-`static` changes, and ~20 lines
+in `console_get()`. No new external dependencies.
 
 ## Build dependencies
 
@@ -158,16 +197,20 @@ build system; the patch will need to be adapted.
 
 ## Roadmap
 
-Already landed in this release: breakpoints, watchpoints, reset,
-state polling, pause-at-boot. See [docs/ROADMAP.md](docs/ROADMAP.md)
-for what's next:
+Landed in this release: pause/resume, single-step, reset,
+breakpoints, watchpoints (with `mustchange` filter), memory R/W,
+register R/W, disassembly, chipset register snapshot, state save/load,
+sticky-pause via patched `console_get`, pause-at-boot.
 
-- Single-step (`/v1/step`)
-- Memory write (`POST /v1/mem`)
-- Register write (`POST /v1/cpu/d0` etc.)
-- State load (`POST /v1/state/load`)
-- Debugger command pass-through (`POST /v1/debug?cmd=`)
-- WebSocket event stream (notify on breakpoint hit)
+See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next:
+
+- Symbol lookup / source line mapping (Kickstart `.fd` files, `.sym` files)
+- Memory map endpoint (region descriptors: chip / slow / fast / ROM / IO)
+- Step-over (skip JSR/BSR) and step-out (run until RTS)
+- WebSocket event stream (notify on breakpoint hit instead of polling)
+- Debugger command pass-through (`POST /v1/debug?cmd=...`)
+- Frontend debugger (cross-platform UI built on this API)
+- MCP server wrapper (so LLM agents can drive FS-UAE natively)
 - Windows port (currently compiles to a no-op stub on Win32)
 
 ## Background
