@@ -10,11 +10,21 @@
  * and snapshot state, without keyboard interaction.
  *
  * Activation:
- *     FSUAE_RPC_PORT=8765 fs-uae <config>
+ *     FSUAE_RPC_PORT=8765 fs-uae <config>            (HTTP + WS + web UI)
+ *     FSUAE_GDB_PORT=2331 fs-uae <config>            (GDB remote stub)
  *
- * If the env var is not set, this module is a no-op (fsuae_rpc_init
- * returns immediately).  The HTTP server runs in its own worker thread
- * and binds 127.0.0.1 only (no remote network access).
+ * The two ports are independent — enable either, both, or neither.  If
+ * neither env var is set, this module is a no-op.  All listeners bind
+ * 127.0.0.1 only (no remote network access).
+ *
+ * The GDB stub speaks the Remote Serial Protocol and advertises itself
+ * as an m68k big-endian target via qXfer:features:read:target.xml, so:
+ *
+ *     (gdb) target remote :2331
+ *
+ * "Just works" with no `set architecture` or `set endian` needed.  Stop
+ * events are pushed by the pulse thread the moment debugger_active flips
+ * — no client-side polling.
  *
  * Concurrency notes:
  *     - Memory and register reads are SAFE while the emulator is PAUSED
@@ -53,11 +63,27 @@
  *     GET  /v1/symbols                     full known-address table
  *     GET  /v1/symbols/lookup?addr=HEX     lookup name for an address
  *     GET  /v1/fd/exec                     exec.library function table
- *     GET  /v1/fd/lookup?offset=N          lookup exec function by -offset
+ *     GET  /v1/fd/lookup?offset=N&library=NAME
+ *                                          lookup function by -offset (default lib=exec)
+ *     GET  /v1/fd/libraries                list loaded FD libraries
+ *     GET  /v1/fd/list?library=NAME        full function table for a loaded library
+ *     POST /v1/fd/load?path=ABS&library=NAME
+ *                                          parse an .fd file at runtime and
+ *                                          register its function table under
+ *                                          the given library name
+ *
+ * v1 endpoints — memory map + stack:
+ *     GET  /v1/memmap                      region descriptors (chip/slow/fast/
+ *                                          ROM/IO/unmapped) by walking mem_banks
+ *     GET  /v1/stack?depth=N               return N words from A7 with heuristic
+ *                                          classification (likely-code / data)
  *
  * v1 endpoints — breakpoints & watchpoints:
- *     POST /v1/breakpoints?addr=HEX        install PC breakpoint, auto-pause on hit
- *     GET  /v1/breakpoints                 list active breakpoints
+ *     POST /v1/breakpoints?addr=HEX&skip=N&oneshot=0|1
+ *                                          install PC breakpoint, auto-pause on hit
+ *                                          skip=N → silently ignore the first N hits
+ *                                          oneshot=1 → auto-clear after first fire
+ *     GET  /v1/breakpoints                 list active breakpoints with hit counts
  *     POST /v1/breakpoints/clear           remove all breakpoints
  *     POST /v1/watchpoints?addr=HEX&size=N&rwi=W&mustchange=0|1
  *                              &val=HEX&valmask=HEX
@@ -69,6 +95,14 @@
  *     POST /v1/watchpoints/rearm           re-wrap mem banks (use after /v1/reset)
  *     GET  /v1/watchpoints/last            details of last triggered watchpoint
  *                                          (PC at hit, addr, value, etc.)
+ *
+ * v1 endpoints — stepping (extended):
+ *     POST /v1/step?n=N                    execute N instructions then pause
+ *     POST /v1/step?mode=over              run until PC reaches the instruction
+ *                                          AFTER the current one (steps over JSR/BSR
+ *                                          by installing a one-shot BP at PC+insn_len)
+ *     POST /v1/step?mode=out               run until PC returns to caller (reads
+ *                                          long at (A7), installs one-shot BP there)
  *
  * Conventions:
  *     - addr / len / value query params accept decimal, 0x-prefixed hex,
@@ -106,6 +140,22 @@ extern uae_u16 dmacon;
 extern uae_u16 intena, intreq;
 extern unsigned int bplcon0;
 
+/* For the memory-map endpoint we walk the live bank table.  mem_banks[]
+ * is a hardware-mapped array (size MEMORY_BANKS) of addrbank* — each
+ * entry covers 64KB of address space.  dummy_bank is the unmapped marker.
+ * currprefs.address_space_24 tells us whether the chipset is configured
+ * for the original 24-bit 68000 address space (256 banks) or the full
+ * 32-bit space (65536 banks).
+ *
+ * Note: addrbank and uae_prefs are typedefs (no `struct` keyword needed). */
+extern addrbank *mem_banks[];
+extern addrbank dummy_bank;
+extern struct uae_prefs currprefs;
+
+/* Forward-declared sizes so the disasm annotator (defined long before the
+ * FD library section) can declare a fixed-size library-name buffer. */
+#define FD_LIB_NAME_LEN     32
+
 /* Embedded single-page web debugger.  Generated from web/index.html.   */
 #include "web_index.inc"
 
@@ -117,9 +167,14 @@ void initialize_memwatch(int mode);
 extern int skipaddr_doskip;
 extern int no_trace_exceptions;
 
-/* Forward decl — defined later in this file; used by the disasm
- * annotator before its full definition. */
+/* Forward decls — defined later in this file; used by the disasm
+ * annotator before their full definitions. */
 static const char *exec_fd_lookup(int neg_offset);
+static const char *fd_lookup_any(int neg_offset, const char *prefer,
+                                  const char **lib_out);
+/* Defined in the GDB stub section; called from ws_pulse_thread to wake
+ * gdb clients blocked on continue/step. */
+static void gdb_signal_event(void);
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -322,6 +377,38 @@ static void ep_resume(int fd) {
 /* External — defined in debug.cpp.  These globals control single-stepping. */
 extern int debugging;
 
+/* ===== Per-breakpoint metadata (skip + oneshot) =====
+ *
+ * FS-UAE's `struct breakpoint_node` only has {addr, enabled} — no hit count,
+ * no skip behaviour.  We maintain parallel arrays for the extra state.
+ *
+ *   bp_skip[i]      — number of remaining hits to silently ignore
+ *   bp_hit_count[i] — cumulative times this BP has fired
+ *   bp_oneshot[i]   — if 1, clear this BP after first fire
+ *
+ * The pulse thread reads these on every paused-state transition and decides
+ * whether to silently auto-resume (skip>0 or transitional) or surface the
+ * paused event to clients. */
+static int bp_skip[BREAKPOINT_TOTAL];
+static int bp_hit_count[BREAKPOINT_TOTAL];
+static int bp_oneshot[BREAKPOINT_TOTAL];
+
+/* Install a one-shot BP at `addr` and resume.  Returns slot on success,
+ * -1 on no-free-slot.  Used by step-over / step-out. */
+static int install_oneshot_bp(uae_u32 addr) {
+    int slot = -1;
+    for (int i = 0; i < BREAKPOINT_TOTAL; i++) {
+        if (!bpnodes[i].enabled) { slot = i; break; }
+    }
+    if (slot < 0) return -1;
+    bpnodes[slot].addr = addr;
+    bpnodes[slot].enabled = 1;
+    bp_skip[slot] = 0;
+    bp_hit_count[slot] = 0;
+    bp_oneshot[slot] = 1;
+    return slot;
+}
+
 static void ep_step(int fd, const char *qs) {
     /* Execute N instructions then re-pause.  Maps to FS-UAE's 't' trace
      * command internals: set skipaddr_doskip to step count, set
@@ -330,7 +417,67 @@ static void ep_step(int fd, const char *qs) {
      * We must clear debugger_active (so the debugger's inner stdin-read
      * loop returns and the CPU resumes) WITHOUT clearing `debugging` —
      * the CPU loop only re-enters debug() when `debugging` is true, and
-     * that re-entry is what makes single-stepping work. */
+     * that re-entry is what makes single-stepping work.
+     *
+     * Modes (mode=over / mode=out) bypass the step counter entirely and
+     * install a one-shot BP at the expected next-PC, then resume. */
+
+    char *mode = get_query_param(qs, "mode");
+    char mode_buf[16] = "";
+    if (mode) snprintf(mode_buf, sizeof mode_buf, "%s", mode);
+
+    if (mode_buf[0] && !strcmp(mode_buf, "over")) {
+        /* Step over: install one-shot BP at PC + current insn length.
+         * Use m68k_disasm_2 with count=1 to get the next-PC for free. */
+        uae_u32 pc = (uae_u32)m68k_getpc();
+        TCHAR tmp[MAX_LINEWIDTH + 4];
+        uaecptr nextpc = 0;
+        m68k_disasm_2(tmp, sizeof tmp, pc, &nextpc, 1, NULL, NULL, 1);
+        if (nextpc == 0 || nextpc == pc) {
+            err_response(fd, 500, "disasm could not advance PC");
+            return;
+        }
+        int slot = install_oneshot_bp((uae_u32)nextpc);
+        if (slot < 0) { err_response(fd, 500, "no free bp slot for step-over"); return; }
+        rearm_watchpoints_if_any();
+        deactivate_debugger();
+        char body[256];
+        snprintf(body, sizeof body,
+            "{\"ok\":true,\"mode\":\"over\",\"oneshot_at\":\"0x%08x\",\"slot\":%d}\n",
+            (unsigned)nextpc, slot);
+        send_response(fd, 200, body);
+        return;
+    }
+
+    if (mode_buf[0] && !strcmp(mode_buf, "out")) {
+        /* Step out: read the long at (A7) — for ordinary JSR/BSR call
+         * conventions this is the return address.  Install a one-shot BP
+         * there and resume.  Caveats: doesn't work for RTE, doesn't work
+         * if the callee has manipulated the stack, doesn't work for
+         * tail-called code.  Best-effort. */
+        uae_u32 sp = (uae_u32)regs.regs[8 + 7];  /* A7 */
+        uae_u32 ret = (uae_u32)get_long_debug(sp);
+        if (ret == 0 || (ret & 1)) {
+            char body[256];
+            snprintf(body, sizeof body,
+                "{\"ok\":false,\"err\":\"unlikely return PC at (A7)\","
+                "\"sp\":\"0x%08x\",\"candidate\":\"0x%08x\"}\n",
+                (unsigned)sp, (unsigned)ret);
+            send_response(fd, 400, body);
+            return;
+        }
+        int slot = install_oneshot_bp(ret);
+        if (slot < 0) { err_response(fd, 500, "no free bp slot for step-out"); return; }
+        rearm_watchpoints_if_any();
+        deactivate_debugger();
+        char body[256];
+        snprintf(body, sizeof body,
+            "{\"ok\":true,\"mode\":\"out\",\"oneshot_at\":\"0x%08x\",\"sp\":\"0x%08x\",\"slot\":%d}\n",
+            (unsigned)ret, (unsigned)sp, slot);
+        send_response(fd, 200, body);
+        return;
+    }
+
     char *ns = get_query_param(qs, "n");
     int n = 1;
     if (ns) {
@@ -392,8 +539,10 @@ static void ep_bp_list(int fd) {
     for (int i = 0; i < BREAKPOINT_TOTAL; i++) {
         if (!bpnodes[i].enabled) continue;
         n += snprintf(body + n, sizeof body - n,
-            "%s{\"slot\":%d,\"addr\":\"0x%08x\"}",
-            first ? "" : ",", i, (unsigned)bpnodes[i].addr);
+            "%s{\"slot\":%d,\"addr\":\"0x%08x\","
+             "\"skip_remaining\":%d,\"hit_count\":%d,\"oneshot\":%d}",
+            first ? "" : ",", i, (unsigned)bpnodes[i].addr,
+            bp_skip[i], bp_hit_count[i], bp_oneshot[i]);
         first = 0;
     }
     n += snprintf(body + n, sizeof body - n, "]}\n");
@@ -408,6 +557,22 @@ static void ep_bp_add(int fd, const char *qs) {
     int ok = 0;
     uae_u32 addr = parse_uint(addr_buf, &ok);
     if (!ok) { err_response(fd, 400, "bad addr"); return; }
+    /* Optional: skip=N silently ignores the first N hits.  Useful for
+     * heavily-used routines like CopyMem where you want the Nth call. */
+    int skip = 0;
+    char *ss = get_query_param(qs, "skip");
+    if (ss) {
+        char sbuf[16];
+        snprintf(sbuf, sizeof sbuf, "%s", ss);
+        int sok = 0;
+        skip = (int)parse_uint(sbuf, &sok);
+        if (!sok || skip < 0) { err_response(fd, 400, "bad skip"); return; }
+    }
+    /* Optional: oneshot=1 — auto-clear this BP the first time it fires.
+     * Used internally by step-over and step-out. */
+    int oneshot = 0;
+    char *os = get_query_param(qs, "oneshot");
+    if (os && (os[0]=='1' || os[0]=='y' || os[0]=='Y')) oneshot = 1;
     /* find first free slot */
     int slot = -1;
     for (int i = 0; i < BREAKPOINT_TOTAL; i++) {
@@ -419,10 +584,14 @@ static void ep_bp_add(int fd, const char *qs) {
     }
     bpnodes[slot].addr = addr;
     bpnodes[slot].enabled = 1;
+    bp_skip[slot] = skip;
+    bp_hit_count[slot] = 0;
+    bp_oneshot[slot] = oneshot;
     char body[256];
     snprintf(body, sizeof body,
-        "{\"ok\":true,\"slot\":%d,\"addr\":\"0x%08x\"}\n",
-        slot, (unsigned)addr);
+        "{\"ok\":true,\"slot\":%d,\"addr\":\"0x%08x\","
+        "\"skip\":%d,\"oneshot\":%d}\n",
+        slot, (unsigned)addr, skip, oneshot);
     send_response(fd, 200, body);
 }
 
@@ -434,6 +603,9 @@ static void ep_bp_clear(int fd) {
             bpnodes[i].addr = 0;
             cleared++;
         }
+        bp_skip[i] = 0;
+        bp_hit_count[i] = 0;
+        bp_oneshot[i] = 0;
     }
     char body[128];
     snprintf(body, sizeof body, "{\"ok\":true,\"cleared\":%d}\n", cleared);
@@ -733,14 +905,20 @@ static void ep_disasm(int fd, const char *qs) {
 
     /* Optional annotation: if annotate=1 (or ?annot=1), look at each
      * line for `JSR -nn(A6)` and `JMP -nn(A6)` and append the matching
-     * exec-library function name (if known).  This is heuristic — it
-     * blindly assumes A6 points to ExecBase, which holds for most
-     * Kickstart code but not for app code that swaps A6 to other libs. */
+     * library function name (if known).  This is heuristic — it blindly
+     * assumes A6 points at a library base; without A6-tracking we can't
+     * know which library so we scan every loaded FD table for a match.
+     *
+     * Caller can hint via &library=NAME — that library is checked first,
+     * so when multiple libs share an offset (rare) the hint wins. */
     int annotate = 0;
     char *anns = get_query_param(qs, "annotate");
     if (!anns) anns = get_query_param(qs, "annot");
     if (anns && (anns[0] == '1' || anns[0] == 'y' || anns[0] == 'Y'))
         annotate = 1;
+    char *libs = get_query_param(qs, "library");
+    char prefer_lib[FD_LIB_NAME_LEN] = "exec";
+    if (libs && *libs) snprintf(prefer_lib, sizeof prefer_lib, "%s", libs);
 
     static char body[131072];
     int n = snprintf(body, sizeof body,
@@ -797,7 +975,15 @@ static void ep_disasm(int fd, const char *qs) {
                      * 16-bit signed displacement in unsigned form. */
                     if (v > 0x7FFF) v -= 0x10000;
                     if (neg && v > 0) v = -v;
-                    if (v < 0) fn = exec_fd_lookup(v);
+                    if (v < 0) {
+                        const char *src_lib = prefer_lib;
+                        fn = fd_lookup_any(v, prefer_lib, &src_lib);
+                        if (fn) {
+                            n += snprintf(body + n, sizeof body - n,
+                                "       ; %s.%s()", src_lib, fn);
+                            fn = NULL;  /* already emitted */
+                        }
+                    }
                 }
             }
             if (fn) {
@@ -877,6 +1063,143 @@ static void ep_custom(int fd) {
     n += snprintf(body + n, sizeof body - n, "]");
 
     n += snprintf(body + n, sizeof body - n, "}\n");
+    send_response(fd, 200, body);
+}
+
+/* ----- Memory map -----
+ *
+ * Walks the live FS-UAE bank table (mem_banks[]) and emits one JSON record
+ * per contiguous run of identical-bank pointers.  Each bank in mem_banks[]
+ * covers 64KB; consecutive entries pointing at the same addrbank are coalesced.
+ *
+ * For each region we surface:
+ *   start, end           — inclusive byte addresses
+ *   name, label          — bank's human-readable id (from FS-UAE addrbank def)
+ *   kind                 — derived from addrbank.flags (chip-ram / rom / io / etc.)
+ *   size                 — bytes covered
+ *
+ * The mapping is interpreted, not a raw dump.  ABFLAG_NONE banks (unmapped)
+ * are emitted with kind="unmapped" so frontends can render the gaps.  */
+
+static const char *bank_kind(int flags) {
+    /* From uae/memory.h:
+     *   ABFLAG_RAM=1 ABFLAG_ROM=2 ABFLAG_ROMIN=4 ABFLAG_IO=8 ABFLAG_NONE=16
+     *   ABFLAG_CHIPRAM=2048 ABFLAG_CIA=4096
+     * Priority order matches what frontends usually want to render. */
+    if (flags & 16)         return "unmapped";   /* ABFLAG_NONE */
+    if (flags & 4096)       return "cia";        /* ABFLAG_CIA */
+    if (flags & 2048)       return "chipram";    /* ABFLAG_CHIPRAM */
+    if (flags & 8)          return "io";         /* ABFLAG_IO */
+    if (flags & 2)          return "rom";        /* ABFLAG_ROM */
+    if (flags & 4)          return "romin";      /* ABFLAG_ROMIN (writable shadow) */
+    if (flags & 1)          return "ram";        /* ABFLAG_RAM */
+    return "unknown";
+}
+
+static void ep_memmap(int fd) {
+    /* Use the cpu config to decide how many banks to iterate.  24-bit
+     * mode mirrors $00xxxxxx into the upper banks, so iterating 256
+     * entries is enough; 32-bit mode covers the full 65536. */
+    int total = currprefs.address_space_24 ? 256 : 65536;
+
+    static char body[131072];
+    int n = snprintf(body, sizeof body, "{\"ok\":true,\"address_space_bits\":%d,\"regions\":[",
+                     currprefs.address_space_24 ? 24 : 32);
+    int first = 1;
+    int i = 0;
+    while (i < total && n < (int)sizeof body - 512) {
+        addrbank *b = mem_banks[i];
+        int j = i + 1;
+        while (j < total && mem_banks[j] == b) j++;
+        /* Avoid spamming output with the long unmapped tails — collapsed
+         * but still surfaced so callers see the gaps. */
+        const char *name = "(null)";
+        const char *label = "(null)";
+        int flags = 0;
+        if (b) {
+            /* TCHAR ≡ char on POSIX builds; safe to treat as C-string. */
+            if (b->name)  name  = (const char *)b->name;
+            if (b->label) label = (const char *)b->label;
+            flags = b->flags;
+        }
+        const char *kind = bank_kind(flags);
+        uae_u32 start = (uae_u32)i << 16;
+        uae_u32 end   = (((uae_u32)j << 16) - 1);
+        n += snprintf(body + n, sizeof body - n,
+            "%s{\"start\":\"0x%08x\",\"end\":\"0x%08x\","
+            "\"size\":%u,\"name\":\"%s\",\"label\":\"%s\","
+            "\"kind\":\"%s\",\"flags\":\"0x%x\"}",
+            first ? "" : ",",
+            (unsigned)start, (unsigned)end,
+            (unsigned)((j - i) << 16),
+            name, label, kind, (unsigned)flags);
+        first = 0;
+        i = j;
+    }
+    n += snprintf(body + n, sizeof body - n, "]}\n");
+    send_response(fd, 200, body);
+}
+
+/* ----- Stack walker -----
+ *
+ * No frame format is enforced on m68k, so reliable stack walking would
+ * require either DWARF unwind tables or strict frame-pointer conventions.
+ * Instead we surface the raw stack words and heuristically tag each one
+ * as "code" or "data":
+ *
+ *   - Even, in a bank with flags & (ABFLAG_RAM|ABFLAG_ROM|ABFLAG_CHIPRAM)
+ *     → likely a saved PC (return address pushed by JSR/BSR).
+ *   - Other → likely data (saved register, local, etc.).
+ *
+ * The caller can then take the "likely code" addresses, disassemble
+ * backwards, and assemble a call chain. */
+
+static int addr_looks_like_code(uae_u32 a) {
+    if (a & 1) return 0;
+    if (a < 0x400) return 0;  /* exception vectors / zero page */
+    int bank = (a >> 16) & 0xFFFF;
+    int total = currprefs.address_space_24 ? 256 : 65536;
+    if (bank >= total) return 0;
+    addrbank *b = mem_banks[bank];
+    if (!b) return 0;
+    int f = b->flags;
+    if (f & 16) return 0;        /* ABFLAG_NONE */
+    /* Allow RAM (1), ROM (2), ROMIN (4), CHIPRAM (2048) */
+    return (f & (1 | 2 | 4 | 2048)) != 0;
+}
+
+static void ep_stack(int fd, const char *qs) {
+    int depth = 32;
+    char *ds = get_query_param(qs, "depth");
+    if (ds) {
+        char dbuf[16];
+        snprintf(dbuf, sizeof dbuf, "%s", ds);
+        int ok = 0;
+        depth = (int)parse_uint(dbuf, &ok);
+        if (!ok || depth < 1 || depth > 1024) {
+            err_response(fd, 400, "bad depth (1..1024)");
+            return;
+        }
+    }
+    uae_u32 sp = (uae_u32)regs.regs[8 + 7];  /* A7 */
+
+    static char body[65536];
+    int n = snprintf(body, sizeof body,
+        "{\"ok\":true,\"sp\":\"0x%08x\",\"depth\":%d,\"words\":[", (unsigned)sp, depth);
+    int first = 1;
+    for (int i = 0; i < depth && n < (int)sizeof body - 256; i++) {
+        uae_u32 a = sp + (uae_u32)(i * 4);
+        uae_u32 v = (uae_u32)get_long_debug(a);
+        int code = addr_looks_like_code(v);
+        n += snprintf(body + n, sizeof body - n,
+            "%s{\"offset\":%d,\"addr\":\"0x%08x\","
+            "\"value\":\"0x%08x\",\"kind\":\"%s\"}",
+            first ? "" : ",", i * 4,
+            (unsigned)a, (unsigned)v,
+            code ? "code" : "data");
+        first = 0;
+    }
+    n += snprintf(body + n, sizeof body - n, "]}\n");
     send_response(fd, 200, body);
 }
 
@@ -1252,24 +1575,249 @@ static const struct fd_entry EXEC_FD[] = {
     {-630, "CopyMemQuick",      "source, dest, size"},
 };
 
-static const char *exec_fd_lookup(int neg_offset) {
-    for (size_t i = 0; i < sizeof EXEC_FD / sizeof EXEC_FD[0]; i++) {
-        if (EXEC_FD[i].offset == neg_offset) return EXEC_FD[i].name;
+/* ----- Multi-library FD registry -----
+ *
+ * The built-in EXEC_FD[] above is registered as library "exec" at startup.
+ * Additional .fd files (graphics.fd, intuition.fd, dos.fd, ...) can be
+ * parsed at runtime via POST /v1/fd/load and added to fd_libs[].
+ *
+ * Parser handles the standard .fd format used by Commodore + the modern
+ * AmigaOS NDK distribution:
+ *
+ *     * comment line
+ *     ##base _GfxBase
+ *     ##bias 30
+ *     ##public
+ *     BltClear(memBlock,byteCount,flags)(a1,d0,d1)
+ *     ##private
+ *     ...
+ *     ##end
+ *
+ * Bias starts positive (typically 30) and increments by 6 per function.
+ * We store offsets as NEGATIVE (so -30, -36, ...) to match the convention
+ * used by the disasm annotator. */
+
+#define FD_MAX_LIBS         16
+/* FD_LIB_NAME_LEN is defined near the top of the file (forward decl). */
+
+struct fd_library {
+    char name[FD_LIB_NAME_LEN];
+    const struct fd_entry *entries;   /* points at static array OR malloc'd */
+    int count;
+    int builtin;                      /* 1 = built-in (don't free entries / names) */
+};
+
+static struct fd_library fd_libs[FD_MAX_LIBS];
+static int fd_lib_count = 0;
+
+static struct fd_library *fd_lib_find(const char *name) {
+    if (!name || !*name) return NULL;
+    for (int i = 0; i < fd_lib_count; i++) {
+        if (strcasecmp(fd_libs[i].name, name) == 0) return &fd_libs[i];
     }
     return NULL;
 }
 
-static void ep_fd_exec(int fd) {
-    static char body[8192];
-    int n = snprintf(body, sizeof body, "{\"ok\":true,\"library\":\"exec\",\"functions\":[");
-    for (size_t i = 0; i < sizeof EXEC_FD / sizeof EXEC_FD[0]; i++) {
+static void fd_register_builtin(const char *name, const struct fd_entry *entries, int count) {
+    if (fd_lib_count >= FD_MAX_LIBS) return;
+    struct fd_library *lib = &fd_libs[fd_lib_count++];
+    snprintf(lib->name, sizeof lib->name, "%s", name);
+    lib->entries = entries;
+    lib->count = count;
+    lib->builtin = 1;
+}
+
+static const char *fd_lookup_in(const char *lib_name, int neg_offset) {
+    struct fd_library *lib = fd_lib_find(lib_name);
+    if (!lib) return NULL;
+    for (int i = 0; i < lib->count; i++) {
+        if (lib->entries[i].offset == neg_offset) return lib->entries[i].name;
+    }
+    return NULL;
+}
+
+/* Annotator helper: scan all loaded libraries for an offset match, with
+ * `prefer` as a tiebreaker.  Returns "libname.FuncName" in a static buf,
+ * or NULL on no match.  Called by the disasm post-processor — at most
+ * once per disasm line, so the static-buffer pattern is safe. */
+static const char *fd_lookup_any(int neg_offset, const char *prefer,
+                                  const char **lib_out) {
+    static char qual[96];
+    /* Preferred library first */
+    if (prefer && *prefer) {
+        const char *nm = fd_lookup_in(prefer, neg_offset);
+        if (nm) {
+            snprintf(qual, sizeof qual, "%s", nm);
+            if (lib_out) *lib_out = prefer;
+            return qual;
+        }
+    }
+    for (int i = 0; i < fd_lib_count; i++) {
+        for (int j = 0; j < fd_libs[i].count; j++) {
+            if (fd_libs[i].entries[j].offset == neg_offset) {
+                snprintf(qual, sizeof qual, "%s", fd_libs[i].entries[j].name);
+                if (lib_out) *lib_out = fd_libs[i].name;
+                return qual;
+            }
+        }
+    }
+    return NULL;
+}
+
+/* Back-compat: the original disasm annotator called exec_fd_lookup.
+ * Keep that signature working by routing through the new registry. */
+static const char *exec_fd_lookup(int neg_offset) {
+    return fd_lookup_in("exec", neg_offset);
+}
+
+/* Parse a .fd file from disk and register it as a new library.  Returns
+ * the number of functions parsed (>=0) or a negative error code:
+ *   -1 = couldn't open file
+ *   -2 = parse error / no functions found
+ *   -3 = registry full */
+static int fd_parse_file(const char *path, const char *lib_name) {
+    if (fd_lib_count >= FD_MAX_LIBS) return -3;
+    /* Replace existing entry with the same name (so /v1/fd/load can be
+     * used to refresh a table during development). */
+    struct fd_library *existing = fd_lib_find(lib_name);
+    if (existing && !existing->builtin) {
+        /* Free per-entry name buffers (each was malloc'd) then the array. */
+        for (int i = 0; i < existing->count; i++) {
+            free((char *)existing->entries[i].name);
+        }
+        free((struct fd_entry *)existing->entries);
+        existing->entries = NULL;
+        existing->count = 0;
+    }
+    FILE *fp = fopen(path, "r");
+    if (!fp) return -1;
+    int bias = 30;
+    int cap = 64, n = 0;
+    struct fd_entry *arr = (struct fd_entry *)calloc(cap, sizeof *arr);
+    if (!arr) { fclose(fp); return -2; }
+    char line[1024];
+    while (fgets(line, sizeof line, fp)) {
+        /* Strip CR/LF and leading WS */
+        char *s = line;
+        while (*s == ' ' || *s == '\t') s++;
+        char *e = s + strlen(s);
+        while (e > s && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ' || e[-1] == '\t')) *--e = 0;
+        if (!*s) continue;
+        if (s[0] == '*') continue;            /* comment */
+        if (strncmp(s, "##end", 5) == 0) break;
+        if (strncmp(s, "##bias", 6) == 0) {
+            bias = atoi(s + 6);
+            if (bias < 0) bias = -bias;
+            continue;
+        }
+        if (s[0] == '#' && s[1] == '#') continue;  /* ##base / ##public / ##private */
+        /* A function line: "Name(args)(regs)" — we only need the name. */
+        char *paren = strchr(s, '(');
+        if (!paren) continue;
+        if (paren == s) continue;             /* malformed */
+        if (n >= cap) {
+            cap *= 2;
+            struct fd_entry *bigger = (struct fd_entry *)realloc(arr, cap * sizeof *arr);
+            if (!bigger) break;
+            arr = bigger;
+        }
+        int nlen = (int)(paren - s);
+        if (nlen > 63) nlen = 63;
+        char *namebuf = (char *)malloc((size_t)nlen + 1);
+        if (!namebuf) break;
+        memcpy(namebuf, s, (size_t)nlen);
+        namebuf[nlen] = 0;
+        arr[n].offset = -bias;
+        arr[n].name   = namebuf;
+        arr[n].args   = "";   /* not preserved — keeps the parser simple */
+        n++;
+        bias += 6;
+    }
+    fclose(fp);
+    if (n == 0) { free(arr); return -2; }
+    if (existing) {
+        existing->entries = arr;
+        existing->count = n;
+        existing->builtin = 0;
+        return n;
+    }
+    if (fd_lib_count >= FD_MAX_LIBS) { free(arr); return -3; }
+    struct fd_library *lib = &fd_libs[fd_lib_count++];
+    snprintf(lib->name, sizeof lib->name, "%s", lib_name);
+    lib->entries = arr;
+    lib->count = n;
+    lib->builtin = 0;
+    return n;
+}
+
+static void ep_fd_load(int fd, const char *qs) {
+    char *ps = get_query_param(qs, "path");
+    if (!ps) { err_response(fd, 400, "missing path"); return; }
+    char path_buf[1024];
+    snprintf(path_buf, sizeof path_buf, "%s", ps);
+    char *ls = get_query_param(qs, "library");
+    if (!ls || !*ls) { err_response(fd, 400, "missing library"); return; }
+    char lib_buf[FD_LIB_NAME_LEN];
+    snprintf(lib_buf, sizeof lib_buf, "%s", ls);
+    int rc = fd_parse_file(path_buf, lib_buf);
+    if (rc == -1) { err_response(fd, 400, "cannot open path"); return; }
+    if (rc == -2) { err_response(fd, 400, "fd parse failed"); return; }
+    if (rc == -3) { err_response(fd, 500, "fd registry full"); return; }
+    char body[256];
+    snprintf(body, sizeof body,
+        "{\"ok\":true,\"library\":\"%s\",\"path\":\"%s\",\"functions\":%d}\n",
+        lib_buf, path_buf, rc);
+    send_response(fd, 200, body);
+}
+
+static void ep_fd_libraries(int fd) {
+    char body[2048];
+    int n = snprintf(body, sizeof body, "{\"ok\":true,\"libraries\":[");
+    for (int i = 0; i < fd_lib_count; i++) {
+        n += snprintf(body + n, sizeof body - n,
+            "%s{\"name\":\"%s\",\"functions\":%d,\"builtin\":%s}",
+            i ? "," : "", fd_libs[i].name, fd_libs[i].count,
+            fd_libs[i].builtin ? "true" : "false");
+    }
+    n += snprintf(body + n, sizeof body - n, "]}\n");
+    send_response(fd, 200, body);
+}
+
+static void ep_fd_list(int fd, const char *qs) {
+    char *ls = get_query_param(qs, "library");
+    const char *lib_name = ls && *ls ? ls : "exec";
+    char lib_buf[FD_LIB_NAME_LEN];
+    snprintf(lib_buf, sizeof lib_buf, "%s", lib_name);
+    struct fd_library *lib = fd_lib_find(lib_buf);
+    if (!lib) { err_response(fd, 404, "unknown library"); return; }
+    static char body[65536];
+    int n = snprintf(body, sizeof body,
+        "{\"ok\":true,\"library\":\"%s\",\"functions\":[", lib->name);
+    for (int i = 0; i < lib->count; i++) {
         n += snprintf(body + n, sizeof body - n,
             "%s{\"offset\":%d,\"name\":\"%s\",\"args\":\"%s\"}",
-            i ? "," : "",
-            EXEC_FD[i].offset,
-            EXEC_FD[i].name,
-            EXEC_FD[i].args);
+            i ? "," : "", lib->entries[i].offset,
+            lib->entries[i].name, lib->entries[i].args ? lib->entries[i].args : "");
         if (n >= (int)sizeof body - 256) break;
+    }
+    n += snprintf(body + n, sizeof body - n, "]}\n");
+    send_response(fd, 200, body);
+}
+
+/* Kept for compat: same as ep_fd_list with library=exec. */
+static void ep_fd_exec(int fd) {
+    static char body[8192];
+    struct fd_library *lib = fd_lib_find("exec");
+    int n = snprintf(body, sizeof body, "{\"ok\":true,\"library\":\"exec\",\"functions\":[");
+    if (lib) {
+        for (int i = 0; i < lib->count; i++) {
+            n += snprintf(body + n, sizeof body - n,
+                "%s{\"offset\":%d,\"name\":\"%s\",\"args\":\"%s\"}",
+                i ? "," : "",
+                lib->entries[i].offset, lib->entries[i].name,
+                lib->entries[i].args ? lib->entries[i].args : "");
+            if (n >= (int)sizeof body - 256) break;
+        }
     }
     n += snprintf(body + n, sizeof body - n, "]}\n");
     send_response(fd, 200, body);
@@ -1283,16 +1831,24 @@ static void ep_fd_lookup(int fd, const char *qs) {
     /* Offsets are typically given as negative; accept both -132 and 132. */
     int off = atoi(obuf);
     if (off > 0) off = -off;
-    const char *name = exec_fd_lookup(off);
+    char *ls = get_query_param(qs, "library");
+    const char *lib_name = "exec";
+    char lib_buf[FD_LIB_NAME_LEN];
+    if (ls && *ls) {
+        snprintf(lib_buf, sizeof lib_buf, "%s", ls);
+        lib_name = lib_buf;
+    }
+    const char *src_lib = lib_name;
+    const char *name = fd_lookup_any(off, lib_name, &src_lib);
     char body[256];
     if (name) {
         snprintf(body, sizeof body,
-            "{\"ok\":true,\"library\":\"exec\",\"offset\":%d,\"name\":\"%s\"}\n",
-            off, name);
+            "{\"ok\":true,\"library\":\"%s\",\"offset\":%d,\"name\":\"%s\"}\n",
+            src_lib, off, name);
     } else {
         snprintf(body, sizeof body,
-            "{\"ok\":true,\"library\":\"exec\",\"offset\":%d,\"name\":null}\n",
-            off);
+            "{\"ok\":true,\"library\":\"%s\",\"offset\":%d,\"name\":null}\n",
+            lib_name, off);
     }
     send_response(fd, 200, body);
 }
@@ -1439,6 +1995,42 @@ static void ws_broadcast(const char *msg) {
     pthread_mutex_unlock(&ws_lock);
 }
 
+/* On a paused-transition where the cause was a PC breakpoint, check our
+ * skip / oneshot bookkeeping.  Returns:
+ *   1 — handled silently (auto-resumed; caller should NOT broadcast paused)
+ *   0 — no BP match or BP fired for real (caller broadcasts paused as usual)
+ *
+ * Called from ws_pulse_thread while debugger_active is non-zero. */
+static int handle_bp_pause(uae_u32 pc, int *bp_slot_out, int *bp_hits_out) {
+    int slot = -1;
+    for (int i = 0; i < BREAKPOINT_TOTAL; i++) {
+        if (bpnodes[i].enabled && bpnodes[i].addr == pc) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) return 0;     /* no BP hit — must have been step/wp/user */
+    bp_hit_count[slot]++;
+    if (bp_slot_out) *bp_slot_out = slot;
+    if (bp_hits_out) *bp_hits_out = bp_hit_count[slot];
+    if (bp_skip[slot] > 0) {
+        /* Not the target hit yet — silently resume. */
+        bp_skip[slot]--;
+        rearm_watchpoints_if_any();
+        deactivate_debugger();
+        return 1;
+    }
+    if (bp_oneshot[slot]) {
+        /* Surface a normal paused event but disable the BP so it won't
+         * fire again.  Useful for step-over / step-out which want exactly
+         * one stop. */
+        bpnodes[slot].enabled = 0;
+        bpnodes[slot].addr = 0;
+        bp_oneshot[slot] = 0;
+    }
+    return 0;
+}
+
 static void *ws_pulse_thread(void *unused) {
     (void)unused;
     int last_active = -1;
@@ -1446,18 +2038,37 @@ static void *ws_pulse_thread(void *unused) {
     for (;;) {
         usleep(50000);  /* 50 ms */
         if (debugger_active != last_active) {
-            char buf[256];
+            char buf[512];
             if (debugger_active) {
+                uae_u32 pc = (uae_u32)m68k_getpc();
+                int slot = -1, hits = 0;
+                if (handle_bp_pause(pc, &slot, &hits)) {
+                    /* Skipped silently; debugger_active was cleared.
+                     * Re-snapshot for the next loop iteration. */
+                    last_active = debugger_active;
+                    continue;
+                }
                 const char *reason = "user";
                 if (memwatch_triggered) reason = "wp";
+                else if (slot >= 0) reason = "bp";
                 else if (skipaddr_doskip > 0) reason = "step";
-                snprintf(buf, sizeof buf,
-                    "{\"event\":\"paused\",\"pc\":\"0x%08x\",\"reason\":\"%s\"}\n",
-                    (unsigned)m68k_getpc(), reason);
+                if (slot >= 0) {
+                    snprintf(buf, sizeof buf,
+                        "{\"event\":\"paused\",\"pc\":\"0x%08x\","
+                        "\"reason\":\"%s\",\"bp_slot\":%d,\"bp_hits\":%d}\n",
+                        (unsigned)pc, reason, slot, hits);
+                } else {
+                    snprintf(buf, sizeof buf,
+                        "{\"event\":\"paused\",\"pc\":\"0x%08x\",\"reason\":\"%s\"}\n",
+                        (unsigned)pc, reason);
+                }
             } else {
                 snprintf(buf, sizeof buf, "{\"event\":\"running\"}\n");
             }
             ws_broadcast(buf);
+            /* Wake any gdb worker blocked in continue/step.  Cheap even
+             * when no gdb client is connected. */
+            gdb_signal_event();
             last_active = debugger_active;
         }
         if (memwatch_triggered != last_trig && memwatch_triggered > 0) {
@@ -1549,6 +2160,648 @@ static void ep_state_load(int fd, const char *qs) {
     snprintf(body, sizeof body,
         "{\"ok\":true,\"path\":\"%s\"}\n", path_buf);
     send_response(fd, 200, body);
+}
+
+/* ===== GDB Remote Serial Protocol stub =====
+ *
+ * Exposes the emulator as a GDB remote target on a separate TCP port
+ * (FSUAE_GDB_PORT).  The target description is autoconfigured (m68k +
+ * big-endian) so the user just types `target remote :PORT` — no manual
+ * `set architecture` / `set endian` required.
+ *
+ * Implemented packets:
+ *
+ *   ?                       — last stop reason (returns T05 SIGTRAP)
+ *   g  / G                  — read / write all 18 m68k registers
+ *   p NN / P NN=V           — read / write one register
+ *   m A,L / M A,L:D         — read / write memory
+ *   c / s                   — continue / step
+ *   vCont? / vCont;c|s      — same, in verbose form
+ *   Z0..Z4 / z0..z4         — install / remove BP (0,1) or WP (2,3,4)
+ *   qSupported              — capabilities
+ *   qXfer:features:read:target.xml — target description (architecture + regs)
+ *   qAttached / qC          — already-attached / current thread
+ *   qfThreadInfo / qsThreadInfo — single-thread list ("m1" then "l")
+ *   qSymbol / qTStatus / vMustReplyEmpty — minimal stubs
+ *   H g0 / H c -1           — set thread for ops (no-op, returns OK)
+ *   D / k                   — detach / kill (closes the session)
+ *
+ * Threading:
+ *   gdb_listener_thread     — accept() loop, spawns one worker per client
+ *   gdb_client_thread       — per-connection RSP packet loop
+ *   ws_pulse_thread         — already monitors debugger_active; we hook in
+ *                             gdb_signal_event() so blocked continue/step
+ *                             calls wake up the instant the emulator pauses
+ *
+ * Concurrency model matches the rest of this file: per-client thread reads
+ * regs / memory / bpnodes directly, relying on the emulator being paused
+ * for stable reads — which it always is between gdb packets.
+ */
+
+#define GDB_MAX_CLIENTS  4
+#define GDB_RX_BUF       8192
+#define GDB_TX_BUF       8192
+
+static int gdb_clients[GDB_MAX_CLIENTS];
+static pthread_mutex_t gdb_clients_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Stop-event cond — signalled by the pulse thread whenever
+ * debugger_active changes.  gdb_wait_for_pause() blocks on this so a
+ * worker thread that just issued `c` / `s` parks until the emulator
+ * actually re-pauses (BP, WP, step complete, user pause, etc.). */
+static pthread_mutex_t gdb_event_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  gdb_event_cond = PTHREAD_COND_INITIALIZER;
+static int gdb_event_seq = 0;
+
+/* Embedded target description.  GDB requests this on connect via
+ * qXfer:features:read:target.xml — once it has this, both architecture
+ * and endianness are autoconfigured.  Without it, the user has to type
+ * `set architecture m68k` + `set endian big` before `target remote`. */
+static const char GDB_TARGET_XML[] = R"GDBXML(<?xml version="1.0"?>
+<!DOCTYPE target SYSTEM "gdb-target.dtd">
+<target version="1.0">
+  <architecture>m68k:68000</architecture>
+  <feature name="org.gnu.gdb.m68k.core">
+    <reg name="d0"  bitsize="32" type="int32"/>
+    <reg name="d1"  bitsize="32" type="int32"/>
+    <reg name="d2"  bitsize="32" type="int32"/>
+    <reg name="d3"  bitsize="32" type="int32"/>
+    <reg name="d4"  bitsize="32" type="int32"/>
+    <reg name="d5"  bitsize="32" type="int32"/>
+    <reg name="d6"  bitsize="32" type="int32"/>
+    <reg name="d7"  bitsize="32" type="int32"/>
+    <reg name="a0"  bitsize="32" type="data_ptr"/>
+    <reg name="a1"  bitsize="32" type="data_ptr"/>
+    <reg name="a2"  bitsize="32" type="data_ptr"/>
+    <reg name="a3"  bitsize="32" type="data_ptr"/>
+    <reg name="a4"  bitsize="32" type="data_ptr"/>
+    <reg name="a5"  bitsize="32" type="data_ptr"/>
+    <reg name="fp"  bitsize="32" type="data_ptr"/>
+    <reg name="sp"  bitsize="32" type="data_ptr"/>
+    <reg name="ps"  bitsize="32" type="int32"/>
+    <reg name="pc"  bitsize="32" type="code_ptr"/>
+  </feature>
+</target>
+)GDBXML";
+
+/* ----- RSP framing ----- */
+
+static uint8_t rsp_checksum(const char *p, size_t n) {
+    uint32_t s = 0;
+    for (size_t i = 0; i < n; i++) s += (uint8_t)p[i];
+    return (uint8_t)(s & 0xFF);
+}
+
+static int rsp_sendall(int fd, const void *buf, size_t n) {
+    const char *p = (const char *)buf;
+    size_t off = 0;
+    while (off < n) {
+        ssize_t w = send(fd, p + off, n - off, MSG_NOSIGNAL);
+        if (w <= 0) return -1;
+        off += (size_t)w;
+    }
+    return 0;
+}
+
+/* Send a $payload#cs packet and wait for an ack.  On NAK we resend up
+ * to twice; otherwise we assume the link is OK and continue. */
+static int rsp_send(int fd, const char *payload) {
+    size_t n = strlen(payload);
+    char tail[8];
+    snprintf(tail, sizeof tail, "#%02x", rsp_checksum(payload, n));
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (rsp_sendall(fd, "$", 1) < 0) return -1;
+        if (n && rsp_sendall(fd, payload, n) < 0) return -1;
+        if (rsp_sendall(fd, tail, strlen(tail)) < 0) return -1;
+        char ack;
+        ssize_t r = recv(fd, &ack, 1, 0);
+        if (r <= 0) return -1;
+        if (ack == '+') return 0;
+        if (ack == '-') continue;
+        /* Some clients (older gdbs) skip the ack entirely.  Treat the
+         * non-ack byte as the start of the next packet. */
+        return 0;
+    }
+    return -1;
+}
+
+/* Receive one packet payload.  Skips noise between packets, sends the
+ * "+" ack after a valid frame.  Returns payload length or -1 on EOF. */
+static int rsp_recv(int fd, char *out, size_t cap) {
+    char c;
+    /* Find a $ */
+    while (1) {
+        ssize_t r = recv(fd, &c, 1, 0);
+        if (r <= 0) return -1;
+        if (c == '$') break;
+    }
+    size_t n = 0;
+    while (1) {
+        ssize_t r = recv(fd, &c, 1, 0);
+        if (r <= 0) return -1;
+        if (c == '#') break;
+        if (n + 1 < cap) out[n++] = c;
+    }
+    out[n] = 0;
+    /* Skip the two-char checksum.  We trust TCP for integrity. */
+    char cs[2];
+    if (recv(fd, cs, 2, 0) != 2) return -1;
+    if (rsp_sendall(fd, "+", 1) < 0) return -1;
+    return (int)n;
+}
+
+/* ----- Hex helpers ----- */
+
+static char gdb_hex_digit(int v) {
+    return (char)((v < 10) ? ('0' + v) : ('a' + v - 10));
+}
+
+static int gdb_hex_val(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static void gdb_hex_u32_be(uae_u32 v, char *out) {
+    for (int i = 0; i < 4; i++) {
+        uae_u8 b = (uae_u8)(v >> ((3 - i) * 8));
+        out[i*2 + 0] = gdb_hex_digit((b >> 4) & 0xF);
+        out[i*2 + 1] = gdb_hex_digit(b & 0xF);
+    }
+}
+
+/* Parse up to 8 hex chars; stops at first non-hex.  Returns count consumed. */
+static int gdb_parse_hex(const char *s, uae_u32 *v) {
+    uae_u32 r = 0;
+    int n = 0;
+    while (n < 8) {
+        int d = gdb_hex_val((unsigned char)s[n]);
+        if (d < 0) break;
+        r = (r << 4) | (uae_u32)d;
+        n++;
+    }
+    *v = r;
+    return n;
+}
+
+/* ----- Register get/set bridges to FS-UAE internals ----- */
+
+/* GDB register layout, matching GDB_TARGET_XML above:
+ *   0..7   D0..D7
+ *   8..15  A0..A7   (a6 = fp, a7 = sp)
+ *   16     PS (sr)
+ *   17     PC                                                                  */
+static void gdb_read_all_regs(char *out144) {
+    for (int i = 0; i < 8; i++)
+        gdb_hex_u32_be((uae_u32)regs.regs[i], out144 + i * 8);
+    for (int i = 0; i < 8; i++)
+        gdb_hex_u32_be((uae_u32)regs.regs[8 + i], out144 + (8 + i) * 8);
+    MakeSR();
+    gdb_hex_u32_be((uae_u32)(regs.sr & 0xFFFF), out144 + 16 * 8);
+    gdb_hex_u32_be((uae_u32)m68k_getpc(),       out144 + 17 * 8);
+}
+
+static void gdb_write_all_regs(const char *in144) {
+    uae_u32 v;
+    for (int i = 0; i < 8; i++) {
+        gdb_parse_hex(in144 + i * 8, &v);
+        regs.regs[i] = v;
+    }
+    for (int i = 0; i < 8; i++) {
+        gdb_parse_hex(in144 + (8 + i) * 8, &v);
+        regs.regs[8 + i] = v;
+    }
+    gdb_parse_hex(in144 + 16 * 8, &v);
+    regs.sr = (uae_u16)(v & 0xFFFF);
+    MakeFromSR();
+    gdb_parse_hex(in144 + 17 * 8, &v);
+    m68k_setpc(v);
+}
+
+static uae_u32 gdb_read_one_reg(int idx) {
+    if (idx >= 0 && idx <= 15) return (uae_u32)regs.regs[idx];
+    if (idx == 16) { MakeSR(); return (uae_u32)(regs.sr & 0xFFFF); }
+    if (idx == 17) return (uae_u32)m68k_getpc();
+    return 0;
+}
+
+static void gdb_write_one_reg(int idx, uae_u32 v) {
+    if (idx >= 0 && idx <= 15) regs.regs[idx] = v;
+    else if (idx == 16) { regs.sr = (uae_u16)(v & 0xFFFF); MakeFromSR(); }
+    else if (idx == 17) m68k_setpc(v);
+}
+
+/* ----- BP / WP packet handlers ----- */
+
+static void gdb_install_bp(uaecptr addr) {
+    /* If an identical-addr BP already exists, leave it alone. */
+    for (int i = 0; i < BREAKPOINT_TOTAL; i++) {
+        if (bpnodes[i].enabled && bpnodes[i].addr == addr) return;
+    }
+    for (int i = 0; i < BREAKPOINT_TOTAL; i++) {
+        if (!bpnodes[i].enabled) {
+            bpnodes[i].addr = addr;
+            bpnodes[i].enabled = 1;
+            bp_skip[i] = 0;
+            bp_hit_count[i] = 0;
+            bp_oneshot[i] = 0;
+            return;
+        }
+    }
+}
+
+static void gdb_remove_bp(uaecptr addr) {
+    for (int i = 0; i < BREAKPOINT_TOTAL; i++) {
+        if (bpnodes[i].enabled && bpnodes[i].addr == addr) {
+            bpnodes[i].enabled = 0;
+            bpnodes[i].addr = 0;
+            bp_skip[i] = 0;
+            bp_hit_count[i] = 0;
+            bp_oneshot[i] = 0;
+        }
+    }
+}
+
+static void gdb_install_wp(int rwi, uaecptr addr, int size) {
+    if (size <= 0) size = 1;
+    if (size > 0x10000) size = 0x10000;
+    initialize_memwatch(0);
+    for (int i = 0; i < MEMWATCH_TOTAL; i++) {
+        if (mwnodes[i].size == 0) {
+            struct memwatch_node *mwn = &mwnodes[i];
+            mwn->addr = addr;
+            mwn->size = size;
+            mwn->rwi = rwi;
+            mwn->val_enabled = 0;
+            mwn->val_mask = 0xFFFFFFFF;
+            mwn->val = 0;
+            mwn->access_mask = MW_MASK_ALL;
+            mwn->reg = 0xFFFFFFFF;
+            mwn->frozen = 0;
+            mwn->mustchange = 0;
+            mwn->modval = 0;
+            mwn->modval_written = 0;
+            mwn->pc = 0xFFFFFFFF;
+            memwatch_setup();
+            return;
+        }
+    }
+}
+
+static void gdb_remove_wp(int rwi, uaecptr addr, int size) {
+    int any = 0;
+    for (int i = 0; i < MEMWATCH_TOTAL; i++) {
+        if (mwnodes[i].size != 0 && mwnodes[i].addr == addr &&
+            mwnodes[i].size == size && mwnodes[i].rwi == rwi) {
+            mwnodes[i].size = 0;
+            any = 1;
+        }
+    }
+    if (any) memwatch_setup();
+}
+
+/* ----- Pause-event sync ----- */
+
+/* Called by ws_pulse_thread on every state transition.  Wakes any
+ * gdb worker blocked in gdb_wait_for_pause(). */
+static void gdb_signal_event(void) {
+    pthread_mutex_lock(&gdb_event_lock);
+    gdb_event_seq++;
+    pthread_cond_broadcast(&gdb_event_cond);
+    pthread_mutex_unlock(&gdb_event_lock);
+}
+
+/* Block until the emulator is paused.  Returns immediately if already
+ * paused; otherwise polls `debugger_active` at 1 ms granularity.
+ *
+ * Why polling instead of the cond-var: a single-step cycle can complete
+ * in well under the pulse-thread's 50 ms tick, leaving the pulse thread
+ * with last_active=1 on both samples and no transition to broadcast.
+ * A cond_var signalled from the pulse thread is therefore unreliable
+ * for tight stepi loops.  Direct polling keeps the worst-case wakeup
+ * latency at 1 ms and burns one CPU only while a continue/step is in
+ * flight. */
+static void gdb_wait_for_pause(void) {
+    while (debugger_active == 0) {
+        usleep(1000);
+    }
+}
+
+/* Build a T05 (SIGTRAP) stop reply with SP + PC pre-cached so GDB can
+ * skip an immediate follow-up `g`. */
+static void gdb_make_stop_reply(char *out, size_t cap) {
+    char sp_hex[9], pc_hex[9];
+    gdb_hex_u32_be((uae_u32)regs.regs[8 + 7], sp_hex); sp_hex[8] = 0;
+    gdb_hex_u32_be((uae_u32)m68k_getpc(),     pc_hex); pc_hex[8] = 0;
+    /* Reg IDs in hex: 0f = a7/SP, 11 = PC.  Critical not to use decimal! */
+    snprintf(out, cap, "T05thread:1;0f:%s;11:%s;", sp_hex, pc_hex);
+}
+
+/* ----- Packet dispatch ----- */
+
+/* Returns 0 to keep the session alive, -1 to terminate (after sending
+ * the reply).  Reply payload written into `out` (NUL-terminated). */
+static int gdb_handle_packet(const char *pkt, int n, char *out, size_t cap) {
+    out[0] = 0;
+    if (n == 0) return 0;
+    char c = pkt[0];
+
+    /* Stop reason — used right after `target remote`. */
+    if (n == 1 && c == '?') {
+        if (!debugger_active) {
+            activate_debugger();
+            /* Give the CPU loop a moment to park in debug_1() so the
+             * regs we snapshot below are stable. */
+            usleep(20000);
+        }
+        gdb_make_stop_reply(out, cap);
+        return 0;
+    }
+    /* Read all regs */
+    if (n == 1 && c == 'g') {
+        char tmp[145];
+        gdb_read_all_regs(tmp);
+        tmp[144] = 0;
+        snprintf(out, cap, "%s", tmp);
+        return 0;
+    }
+    /* Write all regs */
+    if (c == 'G' && n >= 1 + 144) {
+        gdb_write_all_regs(pkt + 1);
+        snprintf(out, cap, "OK");
+        return 0;
+    }
+    /* Read single reg: p NN */
+    if (c == 'p') {
+        uae_u32 idx;
+        if (gdb_parse_hex(pkt + 1, &idx) > 0 && idx < 18) {
+            char tmp[9];
+            gdb_hex_u32_be(gdb_read_one_reg((int)idx), tmp); tmp[8] = 0;
+            snprintf(out, cap, "%s", tmp);
+        } else {
+            snprintf(out, cap, "xxxxxxxx");
+        }
+        return 0;
+    }
+    /* Write single reg: P NN=VVVVVVVV */
+    if (c == 'P') {
+        uae_u32 idx, val;
+        int k = gdb_parse_hex(pkt + 1, &idx);
+        if (k > 0 && pkt[1 + k] == '=' &&
+            gdb_parse_hex(pkt + 1 + k + 1, &val) > 0 && idx < 18) {
+            gdb_write_one_reg((int)idx, val);
+            snprintf(out, cap, "OK");
+        } else {
+            snprintf(out, cap, "E01");
+        }
+        return 0;
+    }
+    /* Read memory: m ADDR,LEN */
+    if (c == 'm') {
+        const char *comma = strchr(pkt + 1, ',');
+        if (!comma) { snprintf(out, cap, "E01"); return 0; }
+        uae_u32 addr, len;
+        gdb_parse_hex(pkt + 1, &addr);
+        gdb_parse_hex(comma + 1, &len);
+        /* Cap to fit in the response buffer (2 hex chars per byte). */
+        size_t max_bytes = (cap - 4) / 2;
+        if (len > max_bytes) len = (uae_u32)max_bytes;
+        size_t off = 0;
+        for (uae_u32 i = 0; i < len; i++) {
+            uae_u8 b = (uae_u8)(get_byte_debug(addr + i) & 0xFF);
+            out[off++] = gdb_hex_digit((b >> 4) & 0xF);
+            out[off++] = gdb_hex_digit(b & 0xF);
+        }
+        out[off] = 0;
+        return 0;
+    }
+    /* Write memory: M ADDR,LEN:DATA */
+    if (c == 'M') {
+        const char *comma = strchr(pkt + 1, ',');
+        const char *colon = strchr(pkt + 1, ':');
+        if (!comma || !colon || colon < comma) {
+            snprintf(out, cap, "E01"); return 0;
+        }
+        uae_u32 addr, len;
+        gdb_parse_hex(pkt + 1, &addr);
+        gdb_parse_hex(comma + 1, &len);
+        const char *data = colon + 1;
+        for (uae_u32 i = 0; i < len; i++) {
+            int hi = gdb_hex_val((unsigned char)data[i * 2]);
+            int lo = gdb_hex_val((unsigned char)data[i * 2 + 1]);
+            if (hi < 0 || lo < 0) break;
+            debug_write_memory_8(addr + i, (uae_u8)((hi << 4) | lo));
+        }
+        snprintf(out, cap, "OK");
+        return 0;
+    }
+    /* Continue */
+    if (n == 1 && c == 'c') {
+        rearm_watchpoints_if_any();
+        deactivate_debugger();
+        gdb_wait_for_pause();
+        gdb_make_stop_reply(out, cap);
+        return 0;
+    }
+    /* Step one instruction */
+    if (n == 1 && c == 's') {
+        rearm_watchpoints_if_any();
+        skipaddr_doskip = 1;
+        no_trace_exceptions = 1;
+        exception_debugging = 1;
+        debugging = 1;
+        debugger_active = 0;
+        set_special(SPCFLAG_BRK);
+        gdb_wait_for_pause();
+        gdb_make_stop_reply(out, cap);
+        return 0;
+    }
+    /* Breakpoints + watchpoints: Z/z TYPE,ADDR,KIND */
+    if ((c == 'Z' || c == 'z') && n >= 5) {
+        char type = pkt[1];
+        if (pkt[2] != ',') { snprintf(out, cap, "E01"); return 0; }
+        uae_u32 addr;
+        int k = gdb_parse_hex(pkt + 3, &addr);
+        uae_u32 kind = 1;
+        if (pkt[3 + k] == ',') gdb_parse_hex(pkt + 3 + k + 1, &kind);
+        int is_install = (c == 'Z');
+        if (type == '0' || type == '1') {
+            if (is_install) gdb_install_bp((uaecptr)addr);
+            else            gdb_remove_bp((uaecptr)addr);
+            snprintf(out, cap, "OK");
+            return 0;
+        }
+        /* rwi mapping: Z2 = write (W=2), Z3 = read (R=1), Z4 = access (RW=3) */
+        if (type == '2' || type == '3' || type == '4') {
+            int rwi = (type == '2') ? 2 : (type == '3') ? 1 : 3;
+            if (is_install) gdb_install_wp(rwi, (uaecptr)addr, (int)kind);
+            else            gdb_remove_wp(rwi, (uaecptr)addr, (int)kind);
+            snprintf(out, cap, "OK");
+            return 0;
+        }
+        /* Unknown breakpoint type — empty reply tells GDB it's unsupported. */
+        return 0;
+    }
+    /* Detach / kill */
+    if (n == 1 && (c == 'D' || c == 'k')) {
+        snprintf(out, cap, "OK");
+        rearm_watchpoints_if_any();
+        deactivate_debugger();
+        return -1;
+    }
+    /* Query packets */
+    if (c == 'q') {
+        if (!strncmp(pkt, "qSupported", 10)) {
+            snprintf(out, cap,
+                "PacketSize=2000;swbreak+;hwbreak+;qXfer:features:read+");
+            return 0;
+        }
+        if (!strncmp(pkt, "qXfer:features:read:target.xml:", 31)) {
+            /* Args: OFFSET,LENGTH (hex).  Reply: 'm' (more) or 'l' (last)
+             * followed by chunk bytes.  Our XML fits in one chunk, but
+             * GDB may still issue paginated reads. */
+            const char *args = pkt + 31;
+            uae_u32 off, len;
+            int k = gdb_parse_hex(args, &off);
+            if (args[k] != ',') { snprintf(out, cap, "E00"); return 0; }
+            gdb_parse_hex(args + k + 1, &len);
+            size_t xml_len = sizeof(GDB_TARGET_XML) - 1;
+            if (off >= xml_len) { snprintf(out, cap, "l"); return 0; }
+            size_t remaining = xml_len - off;
+            int more = (len < remaining);
+            size_t take = more ? len : remaining;
+            if (take > cap - 4) take = cap - 4;
+            out[0] = more ? 'm' : 'l';
+            memcpy(out + 1, GDB_TARGET_XML + off, take);
+            out[1 + take] = 0;
+            return 0;
+        }
+        if (!strncmp(pkt, "qXfer:", 6))         { snprintf(out, cap, "l");  return 0; }
+        if (!strcmp(pkt, "qAttached"))          { snprintf(out, cap, "1");  return 0; }
+        if (!strcmp(pkt, "qC"))                 { snprintf(out, cap, "QC1"); return 0; }
+        if (!strcmp(pkt, "qfThreadInfo"))       { snprintf(out, cap, "m1"); return 0; }
+        if (!strcmp(pkt, "qsThreadInfo"))       { snprintf(out, cap, "l");  return 0; }
+        if (!strncmp(pkt, "qSymbol", 7))        { snprintf(out, cap, "OK"); return 0; }
+        /* Unknown q* — empty = unsupported. */
+        return 0;
+    }
+    /* v packets */
+    if (c == 'v') {
+        if (!strcmp(pkt, "vMustReplyEmpty")) return 0;
+        if (!strcmp(pkt, "vCont?")) { snprintf(out, cap, "vCont;c;s"); return 0; }
+        if (!strncmp(pkt, "vCont;c", 7)) {
+            rearm_watchpoints_if_any();
+            deactivate_debugger();
+            gdb_wait_for_pause();
+            gdb_make_stop_reply(out, cap);
+            return 0;
+        }
+        if (!strncmp(pkt, "vCont;s", 7)) {
+            rearm_watchpoints_if_any();
+            skipaddr_doskip = 1;
+            no_trace_exceptions = 1;
+            exception_debugging = 1;
+            debugging = 1;
+            debugger_active = 0;
+            set_special(SPCFLAG_BRK);
+            gdb_wait_for_pause();
+            gdb_make_stop_reply(out, cap);
+            return 0;
+        }
+        return 0;
+    }
+    /* H packets — set thread for ops (we have one thread; accept all). */
+    if (c == 'H') { snprintf(out, cap, "OK"); return 0; }
+    /* Default: empty reply = "feature not implemented". */
+    return 0;
+}
+
+/* ----- Client + listener threads ----- */
+
+static void gdb_register_client(int fd) {
+    pthread_mutex_lock(&gdb_clients_lock);
+    for (int i = 0; i < GDB_MAX_CLIENTS; i++) {
+        if (gdb_clients[i] < 0) { gdb_clients[i] = fd; break; }
+    }
+    pthread_mutex_unlock(&gdb_clients_lock);
+}
+
+static void gdb_unregister_client(int fd) {
+    pthread_mutex_lock(&gdb_clients_lock);
+    for (int i = 0; i < GDB_MAX_CLIENTS; i++) {
+        if (gdb_clients[i] == fd) { gdb_clients[i] = -1; break; }
+    }
+    pthread_mutex_unlock(&gdb_clients_lock);
+}
+
+static void *gdb_client_thread(void *arg) {
+    int fd = (int)(intptr_t)arg;
+#ifdef SO_NOSIGPIPE
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+#endif
+    gdb_register_client(fd);
+    /* Pause on connect — gdb assumes a stopped target. */
+    activate_debugger();
+    /* Per-connection buffers on the stack — no contention between
+     * concurrent clients. */
+    char rx[GDB_RX_BUF];
+    char tx[GDB_TX_BUF];
+    for (;;) {
+        int n = rsp_recv(fd, rx, sizeof rx);
+        if (n < 0) break;
+        int rc = gdb_handle_packet(rx, n, tx, sizeof tx);
+        if (rsp_send(fd, tx) < 0) break;
+        if (rc < 0) break;
+    }
+    close(fd);
+    gdb_unregister_client(fd);
+    return NULL;
+}
+
+static void *gdb_listener_thread(void *arg) {
+    int port = (int)(intptr_t)arg;
+    int srv = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv < 0) {
+        fprintf(stderr, "[fsuae-rpc] gdb socket() failed: %s\n", strerror(errno));
+        return NULL;
+    }
+    int one = 1;
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port = htons((uint16_t)port);
+    if (bind(srv, (struct sockaddr *)&sa, sizeof sa) < 0) {
+        fprintf(stderr, "[fsuae-rpc] gdb bind(127.0.0.1:%d) failed: %s\n",
+            port, strerror(errno));
+        close(srv);
+        return NULL;
+    }
+    if (listen(srv, 4) < 0) {
+        fprintf(stderr, "[fsuae-rpc] gdb listen() failed: %s\n", strerror(errno));
+        close(srv);
+        return NULL;
+    }
+    fprintf(stderr, "[fsuae-rpc] gdb stub listening on 127.0.0.1:%d (m68k be)\n",
+        port);
+    for (;;) {
+        int cfd = accept(srv, NULL, NULL);
+        if (cfd < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        pthread_t t;
+        if (pthread_create(&t, NULL, gdb_client_thread,
+                           (void *)(intptr_t)cfd) == 0)
+            pthread_detach(t);
+        else
+            close(cfd);
+    }
+    close(srv);
+    return NULL;
 }
 
 /* ----- Request parser + dispatcher ----- */
@@ -1643,6 +2896,16 @@ static void handle_request(int fd) {
         ep_fd_exec(fd);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/fd/lookup") == 0) {
         ep_fd_lookup(fd, qs);
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/fd/libraries") == 0) {
+        ep_fd_libraries(fd);
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/fd/list") == 0) {
+        ep_fd_list(fd, qs);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/fd/load") == 0) {
+        ep_fd_load(fd, qs);
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/memmap") == 0) {
+        ep_memmap(fd);
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/stack") == 0) {
+        ep_stack(fd, qs);
     } else {
         err_response(fd, 404, "no such endpoint");
     }
@@ -1699,26 +2962,55 @@ extern "C" void fsuae_rpc_init(void) {
 
     /* Init the websocket-client slot array — -1 means "free". */
     for (int i = 0; i < WS_MAX_CLIENTS; i++) ws_clients[i] = -1;
+    /* Same for gdb-stub client slots. */
+    for (int i = 0; i < GDB_MAX_CLIENTS; i++) gdb_clients[i] = -1;
+
+    /* Register the built-in exec.library FD table as the first entry in
+     * the FD library registry.  Additional libraries can be loaded at
+     * runtime via POST /v1/fd/load. */
+    fd_register_builtin("exec", EXEC_FD, (int)(sizeof EXEC_FD / sizeof EXEC_FD[0]));
+
+    /* GDB stub — independent of FSUAE_RPC_PORT.  Enables the RSP
+     * listener on a separate TCP port so `gdb -ex "target remote :PORT"`
+     * works without an external bridge process. */
+    const char *gdb_env = getenv("FSUAE_GDB_PORT");
+    if (gdb_env && *gdb_env) {
+        int gdb_port = atoi(gdb_env);
+        if (gdb_port > 0 && gdb_port <= 65535) {
+            pthread_t gtid;
+            if (pthread_create(&gtid, NULL, gdb_listener_thread,
+                               (void *)(intptr_t)gdb_port) == 0)
+                pthread_detach(gtid);
+            else
+                fprintf(stderr, "[fsuae-rpc] gdb pthread_create failed: %s\n",
+                    strerror(errno));
+        } else {
+            fprintf(stderr, "[fsuae-rpc] invalid FSUAE_GDB_PORT='%s'\n", gdb_env);
+        }
+    }
 
     const char *env = getenv("FSUAE_RPC_PORT");
-    if (!env || !*env) return; /* disabled */
-    int port = atoi(env);
-    if (port <= 0 || port > 65535) {
-        fprintf(stderr, "[fsuae-rpc] invalid FSUAE_RPC_PORT='%s'\n", env);
-        return;
+    if (env && *env) {
+        int port = atoi(env);
+        if (port <= 0 || port > 65535) {
+            fprintf(stderr, "[fsuae-rpc] invalid FSUAE_RPC_PORT='%s'\n", env);
+        } else {
+            pthread_t tid;
+            if (pthread_create(&tid, NULL, rpc_worker,
+                               (void *)(intptr_t)port) != 0) {
+                fprintf(stderr, "[fsuae-rpc] pthread_create failed: %s\n",
+                    strerror(errno));
+            } else {
+                pthread_detach(tid);
+            }
+        }
     }
-    pthread_t tid;
-    if (pthread_create(&tid, NULL, rpc_worker, (void *)(intptr_t)port) != 0) {
-        fprintf(stderr, "[fsuae-rpc] pthread_create failed: %s\n",
-            strerror(errno));
-        return;
-    }
-    pthread_detach(tid);
 
     /* Optional: start paused so the client can install breakpoints /
      * watchpoints BEFORE the emulator executes its first instruction.
      * Useful for catching very-early-boot ROM writes (chip-RAM init,
-     * IRQ vector install, etc.). */
+     * IRQ vector install, etc.).  Applies to either backend (HTTP or
+     * GDB) — useful for gdb users who want to set BPs before reset. */
     const char *pause = getenv("FSUAE_RPC_PAUSE_AT_BOOT");
     if (pause && (pause[0] == '1' || pause[0] == 'y' || pause[0] == 'Y')) {
         fprintf(stderr, "[fsuae-rpc] starting paused (FSUAE_RPC_PAUSE_AT_BOOT=1)\n");

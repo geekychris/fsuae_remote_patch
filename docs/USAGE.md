@@ -1,6 +1,8 @@
 # Usage cookbook
 
-Recipes for common Amiga-debugging tasks using the fsuae_rpc API.
+Quick-reference HTTP recipes.  For a task-oriented walkthrough that
+covers all four interfaces (Web UI, HTTP, GDB, MCP), see
+[`DEBUGGING.md`](DEBUGGING.md).
 
 All examples assume `FSUAE_RPC_PORT=8765` and `BASE=http://127.0.0.1:8765`.
 

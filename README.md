@@ -57,8 +57,9 @@ curl -sX POST $BASE/v1/resume
 ```
 
 See:
-- [`docs/USAGE.md`](docs/USAGE.md) — cookbook of common workflows
-- [`docs/PROTOCOL.md`](docs/PROTOCOL.md) — full endpoint reference
+- [`docs/DEBUGGING.md`](docs/DEBUGGING.md) — how to actually use the debugger (Web UI / HTTP / GDB / MCP), organised by task
+- [`docs/USAGE.md`](docs/USAGE.md) — quick-reference HTTP recipes
+- [`docs/PROTOCOL.md`](docs/PROTOCOL.md) — full endpoint + GDB-stub packet reference
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — how the patch works inside FS-UAE
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — what's next
 - [`examples/`](examples/) — runnable scripts

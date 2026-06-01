@@ -11,6 +11,8 @@
 # Env vars:
 #   FSUAE_BINARY               path to fs-uae (default: /tmp/fsuae-src/fs-uae)
 #   FSUAE_RPC_PORT             port for the debugger API (default: 8765)
+#   FSUAE_GDB_PORT             port for the in-process GDB stub
+#                              (unset = disabled; suggest 2331)
 #   FSUAE_RPC_PAUSE_AT_BOOT    set to 1 to pause at boot
 #   FSUAE_RPC_LOG              path to redirect fs-uae stdout/stderr
 #                              (default: /tmp/fsuae-rpc.log)
@@ -61,6 +63,8 @@ echo "    log:    $FSUAE_RPC_LOG"
 [[ -n "$CONFIG" ]] && echo "    config: $CONFIG"
 
 FSUAE_RPC_PORT="$FSUAE_RPC_PORT" \
+FSUAE_GDB_PORT="${FSUAE_GDB_PORT:-}" \
+FSUAE_RPC_PAUSE_AT_BOOT="${FSUAE_RPC_PAUSE_AT_BOOT:-}" \
     "$FSUAE_BINARY" "${ARGS[@]}" </dev/null >"$FSUAE_RPC_LOG" 2>&1 &
 PID=$!
 disown
@@ -82,6 +86,10 @@ echo
 echo "  Web UI:      http://127.0.0.1:$FSUAE_RPC_PORT/"
 echo "  JSON-RPC:    http://127.0.0.1:$FSUAE_RPC_PORT/v1/*"
 echo "  WebSocket:   ws://127.0.0.1:$FSUAE_RPC_PORT/v1/events"
+if [[ -n "${FSUAE_GDB_PORT:-}" ]]; then
+    echo "  GDB stub:    target remote 127.0.0.1:$FSUAE_GDB_PORT"
+    echo "               gdb -tui -x $HERE/tools/fsuae.gdbinit"
+fi
 echo
 echo "  Stop with:   pkill -f $FSUAE_BINARY"
 echo "  Log tail:    tail -f $FSUAE_RPC_LOG"

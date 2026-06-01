@@ -6,51 +6,51 @@ What's in vs. what's not, and concrete next steps.
 
 - HTTP/JSON-RPC backend (pause, resume, mem, cpu, state, reset, step)
 - Watchpoints (with mustchange + value-match filters, post-reset survival)
-- Breakpoints
-- Disassembly (with optional FD annotation)
+- Breakpoints (with **skip-count** and **one-shot** modes)
+- Disassembly (with multi-library FD annotation)
 - Chipset register snapshot (`/v1/custom`)
 - State save / load
 - Memory write, CPU register write
-- Symbol resolution: ~140 static addresses + ~80 exec.library FD entries
-- WebSocket event stream (pause/resume/wp_hit broadcast)
+- Symbol resolution: ~140 static addresses + exec.library built-in FD
+- WebSocket event stream (pause/resume/wp_hit/bp broadcast)
 - Embedded web UI (single-file vanilla JS, no build tooling)
 - Sticky pause via patched `console_get` (works with `stdin=/dev/null`)
 - Cross-platform build script (macOS + Linux deps auto-installed)
+- **Memory map endpoint** (`/v1/memmap`) — walks `mem_banks[]` and emits
+  chip/slow/fast/ROM/IO/CIA/unmapped region descriptors
+- **Stack walker** (`/v1/stack?depth=N`) — reads `(A7)`+, tags each
+  word as `code` / `data` so callers can manual-walk frames
+- **Step over / step out** — `/v1/step?mode=over|out` installs a
+  one-shot BP at PC+insn_len or `(A7)` then resumes
+- **Multi-library FD load** — `/v1/fd/load?path=&library=` parses
+  `.fd` files at runtime; disasm annotator searches all loaded libs
+- **MCP server wrapper** — `tools/mcp_fsuae.py` exposes 26 fsuae_rpc
+  endpoints as MCP tools (stdio JSON-RPC, no extra deps)
+- **Snapshot diff tooling** — `tools/uss_diff.py` parses the
+  IFF-style `.uss` format and reports per-chunk byte-level deltas
+- **GDB stub (in-process, C++)** — second TCP listener built into the
+  patch itself (`FSUAE_GDB_PORT`).  Speaks GDB Remote Serial Protocol
+  with an embedded m68k target description; stop events pushed via the
+  pulse thread (no polling).  Reads regs / memory / installs BPs and
+  WPs directly through FS-UAE internals — no HTTP round-trip.
 
 ## Next (small, high-impact)
 
 These should each be 1–2 hour additions:
 
-- **`POST /v1/fd/load?path=ABS&library=NAME`** — load any `.fd` file at
-  runtime, not just the built-in exec.fd.  Would enable annotation of
-  graphics.library, intuition.library, dos.library, etc.
-
 - **Conditional breakpoints** — `POST /v1/breakpoints?addr=X&cond=...`
   with a tiny expression language (`a0 == 0xC094D4`, `*$4 != 0`, etc.).
   Currently you have to break unconditionally and filter client-side.
-
-- **`/v1/breakpoints/skip?count=N`** — break only after the Nth hit.
-  For heavily-used routines like `CopyMem` where you want the 47th
-  call, not the first.
 
 - **`POST /v1/exec`** — run an arbitrary 68k instruction by writing
   opcode + operands + setting PC.  Useful for "run this function"
   workflows without modifying memory.
 
-- **Memory map endpoint** — `GET /v1/memmap` returns region descriptors
-  (chip / slow / fast / ROM / IO / unmapped) so frontends can render a
-  memory map at a glance.
-
-- **Step over / step out** — extend `/v1/step` with `mode=over` or
-  `mode=out` for source-level navigation.  Implementation: set a one-shot
-  BP at `PC + insn_len` (over) or stack-top (out), then resume.
+- **`/v1/breakpoints/<slot>/clear`** — clear a single BP by slot id.
+  The gdb_bridge currently has to rebuild the whole list on every
+  `z0` packet because there's no per-BP clear endpoint.
 
 ## Medium (each ~1 day)
-
-- **Multiple library FD support** — extend the static table to a
-  dictionary keyed by library name.  Annotator uses A6 history
-  heuristics or explicit library hint param to pick the right table.
-  Would need `MOVEA.L X(A4), A6` tracking ideally.
 
 - **Hunk-format executable loader** — parse Amiga hunk binaries to
   extract debug data (HUNK_DEBUG, source line tables).  Map PCs to
@@ -61,25 +61,12 @@ These should each be 1–2 hour additions:
   user request.  Auto-refresh on emulator pause; highlight changed
   bytes since last snapshot.
 
-- **Stack walker** — `GET /v1/stack?depth=N` returns frames by
-  following the A7 / A5 chain through saved-PC + saved-A5 conventions.
-  Tricky on m68k because there's no enforced frame format, but works
-  well enough for code compiled with GCC -fno-omit-frame-pointer.
-
-- **Snapshot diff tooling** — given two `.uss` files, summarise which
-  memory regions and registers changed.  Useful for bisection
-  workflows.
-
-- **MCP server wrapper** — Node.js or Python MCP that exposes
-  `/v1/*` as MCP tools (`fsuae.pause`, `fsuae.read_mem`, etc.) so
-  LLM agents can drive fs-uae directly.
+- **A6 tracking for the disasm annotator** — currently the annotator
+  searches every loaded library when it sees `JSR -nn(A6)`.  Track
+  the last `MOVEA.L X(Ai),A6` and prefer the corresponding library
+  to disambiguate when multiple libs share the same offset.
 
 ## Larger (each ~1 week)
-
-- **GDB stub** — translate GDB remote protocol to `/v1/*` so existing
-  GDB-aware tools (Eclipse, VS Code's cortex-debug, etc.) can attach.
-  Would need careful packetisation but the underlying primitives are
-  all there.
 
 - **Source-level debugging via DWARF** — parse DWARF debug info from
   m68k-amigaos-gcc binaries, map every PC to (file, line, column).
