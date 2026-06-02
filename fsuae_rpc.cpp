@@ -183,7 +183,97 @@ static void gdb_signal_event(void);
 #include <errno.h>
 #include <stdint.h>
 
-#ifndef _WIN32
+/* ===== Platform compatibility shim =====
+ *
+ * The rest of this file is written against POSIX (pthreads + BSD
+ * sockets).  On Windows we map the small surface area we use onto
+ * the native equivalents: Winsock2, _beginthreadex, SRWLOCK,
+ * CONDITION_VARIABLE, Sleep().  The code below is then identical
+ * across platforms.
+ *
+ * Build-time requirement on Windows: link against ws2_32.lib.
+ */
+#ifdef _WIN32
+# define WIN32_LEAN_AND_MEAN
+# include <winsock2.h>
+# include <ws2tcpip.h>
+# include <windows.h>
+# include <process.h>
+
+/* Winsock declares SSIZE_T (signed size_t); alias to ssize_t for the
+ * rest of the file. */
+typedef SSIZE_T ssize_t;
+typedef int     socklen_t;
+
+# define close(fd)         closesocket(fd)
+# define usleep(us)        Sleep((DWORD)((us) / 1000))
+# define strcasecmp        _stricmp
+# define strncasecmp       _strnicmp
+# define MSG_NOSIGNAL      0
+# ifndef SHUT_RDWR
+#  define SHUT_RDWR        SD_BOTH
+# endif
+
+/* ---- pthread-style shims using Win32 primitives ----
+ *
+ * SRWLOCK + CONDITION_VARIABLE both have static initializers, so the
+ * existing `PTHREAD_MUTEX_INITIALIZER` / `PTHREAD_COND_INITIALIZER`
+ * patterns translate one-to-one without runtime init calls.
+ */
+
+typedef HANDLE              pthread_t;
+typedef SRWLOCK             pthread_mutex_t;
+typedef CONDITION_VARIABLE  pthread_cond_t;
+
+# define PTHREAD_MUTEX_INITIALIZER   SRWLOCK_INIT
+# define PTHREAD_COND_INITIALIZER    CONDITION_VARIABLE_INIT
+
+static inline int pthread_mutex_lock(pthread_mutex_t *m) {
+    AcquireSRWLockExclusive(m); return 0;
+}
+static inline int pthread_mutex_unlock(pthread_mutex_t *m) {
+    ReleaseSRWLockExclusive(m); return 0;
+}
+static inline int pthread_cond_wait(pthread_cond_t *c, pthread_mutex_t *m) {
+    SleepConditionVariableSRW(c, m, INFINITE, 0); return 0;
+}
+static inline int pthread_cond_broadcast(pthread_cond_t *c) {
+    WakeAllConditionVariable(c); return 0;
+}
+
+/* _beginthreadex expects `unsigned __stdcall(void*)` while pthread fns
+ * are `void*(void*)`.  Trampoline through a heap struct to bridge the
+ * calling conventions. */
+struct fsuae_thread_arg {
+    void *(*fn)(void *);
+    void *arg;
+};
+static unsigned __stdcall fsuae_thread_trampoline(void *p) {
+    struct fsuae_thread_arg *t = (struct fsuae_thread_arg *)p;
+    void *(*fn)(void *) = t->fn;
+    void *arg = t->arg;
+    free(t);
+    fn(arg);
+    return 0;
+}
+static inline int pthread_create(pthread_t *th, void *attr,
+                                  void *(*fn)(void *), void *arg) {
+    (void)attr;
+    struct fsuae_thread_arg *t =
+        (struct fsuae_thread_arg *)malloc(sizeof *t);
+    if (!t) return -1;
+    t->fn = fn; t->arg = arg;
+    uintptr_t h = _beginthreadex(NULL, 0, fsuae_thread_trampoline,
+                                  t, 0, NULL);
+    if (!h) { free(t); return -1; }
+    *th = (HANDLE)h;
+    return 0;
+}
+static inline int pthread_detach(pthread_t th) {
+    CloseHandle(th); return 0;
+}
+
+#else  /* POSIX */
 # include <pthread.h>
 # include <unistd.h>
 # include <signal.h>
@@ -193,12 +283,6 @@ static void gdb_signal_event(void);
 #endif
 
 extern "C" void fsuae_rpc_init(void);
-
-#ifdef _WIN32
-/* v1 is POSIX-only.  Windows port deferred (would use _beginthreadex +
- * winsock2 instead of pthread/BSD sockets).  Compile to a no-op stub. */
-extern "C" void fsuae_rpc_init(void) {}
-#else
 
 /* ----- Tiny JSON / HTTP helpers (no external dependency) ----- */
 
@@ -1884,7 +1968,7 @@ static void ep_sym_list(int fd) {
  * mutex.  No backpressure handling — slow clients get their frames
  * dropped silently. */
 
-#include <pthread.h>
+/* pthread / Win32 shim is set up at the top of the file. */
 
 #define WS_MAX_CLIENTS 8
 static int ws_clients[WS_MAX_CLIENTS];
@@ -2956,9 +3040,17 @@ static void *rpc_worker(void *arg) {
 /* ----- Public init (called from FS-UAE startup) ----- */
 
 extern "C" void fsuae_rpc_init(void) {
+#ifdef _WIN32
+    /* Winsock requires per-process init before any socket() call.
+     * Idempotent across multiple WSAStartup calls (refcounted). */
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+#else
     /* Ignore SIGPIPE — broken client connections would otherwise kill
-     * the entire emulator process.  We rely on send() returning EPIPE. */
+     * the entire emulator process.  We rely on send() returning EPIPE.
+     * Windows has no SIGPIPE; broken sends just return SOCKET_ERROR. */
     signal(SIGPIPE, SIG_IGN);
+#endif
 
     /* Init the websocket-client slot array — -1 means "free". */
     for (int i = 0; i < WS_MAX_CLIENTS; i++) ws_clients[i] = -1;
@@ -3017,5 +3109,3 @@ extern "C" void fsuae_rpc_init(void) {
         activate_debugger();
     }
 }
-
-#endif /* !_WIN32 */

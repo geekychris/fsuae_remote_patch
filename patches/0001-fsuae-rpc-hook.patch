@@ -2,7 +2,21 @@ diff --git a/Makefile.am b/Makefile.am
 index 234a66e3..61c9f710 100644
 --- a/Makefile.am
 +++ b/Makefile.am
-@@ -255,6 +255,7 @@ libuae_a_SOURCES = \
+@@ -67,6 +67,13 @@
+ LIBS += @X11_LIBS@
+ LIBS += @ZLIB_LIBS@
+
++# fsuae_rpc: the embedded HTTP / WebSocket / GDB stub uses Winsock2
++# on Windows.  ws2_32 is usually picked up implicitly by MinGW but
++# add it explicitly here for safety.
++if WINDOWS
++LIBS += -lws2_32
++endif
++
+ AM_LDFLAGS =
+ # AM_LDFLAGS += -rdynamic
+ AM_LDFLAGS += @OS_LDFLAGS@
+@@ -255,6 +262,7 @@ libuae_a_SOURCES = \
  	src/custom.cpp \
  	src/debug.cpp \
  	src/debuginfo.cpp \

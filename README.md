@@ -272,6 +272,19 @@ The patch should apply with little change to other FS-UAE 3.x point
 releases. The main branch (FS-UAE 5 dev) has a meaningfully different
 build system; the patch will need to be adapted.
 
+### Windows
+
+The source compiles on Windows (MinGW / MSYS2) via a small compat shim
+at the top of `fsuae_rpc.cpp` that maps pthreads → Win32 (`SRWLOCK`,
+`CONDITION_VARIABLE`, `_beginthreadex`), BSD sockets → Winsock2,
+`usleep` → `Sleep`, and so on.  `WSAStartup()` is called in
+`fsuae_rpc_init()` on Windows builds, and the patch's `Makefile.am`
+hunk adds `-lws2_32` to the link line under the existing `if WINDOWS`
+conditional.
+
+Not yet runtime-tested on Windows — if you build it under MSYS2 and
+something doesn't work, file an issue with the build log.
+
 ## Concurrency / safety
 
 - Memory and register reads while the emulator is running may race with
@@ -303,7 +316,7 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next — short list:
 - Hunk-format executable loader (Amiga `HUNK_DEBUG` source lines)
 - A6 tracking for the disasm annotator (auto-pick the right library)
 - DWARF-driven source-level debugging for m68k-amigaos-gcc binaries
-- Windows port (currently compiles to a no-op stub on Win32)
+- Runtime-verify the Windows build (compiles, untested under MSYS2)
 
 ## Background
 

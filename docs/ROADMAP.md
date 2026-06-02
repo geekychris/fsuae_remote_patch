@@ -77,10 +77,13 @@ These should each be 1–2 hour additions:
   `POST /v1/state/rewind?frames=N` and `POST /v1/state/replay` to
   navigate the timeline.
 
-- **Windows port** — `claude_rpc.cpp` currently compiles to a no-op
-  stub on `_WIN32`.  Port using `_beginthreadex` + Winsock2 instead
-  of pthread + BSD sockets; the HTTP parser / endpoint logic carries
-  over unchanged.
+- **Windows port** — *compiles*, not yet runtime-verified.  The
+  cross-platform shim at the top of `fsuae_rpc.cpp` maps pthread →
+  Win32 SRWLOCK + CONDITION_VARIABLE + `_beginthreadex`, BSD sockets
+  → Winsock2, `usleep` → `Sleep`.  `WSAStartup()` runs in
+  `fsuae_rpc_init` on `_WIN32`.  Needs someone with an MSYS2/MinGW
+  Windows environment to build + smoke-test the full HTTP and GDB
+  paths.
 
 - **Upstream PR** — submit a polished version to
   [FrodeSolheim/fs-uae](https://github.com/FrodeSolheim/fs-uae) so this
