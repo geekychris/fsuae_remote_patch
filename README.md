@@ -9,19 +9,27 @@ window (you press `Pause` then `` ` `` to drop into the prompt). That makes it
 hard to drive from scripts, MCP servers, CI harnesses, or any sort of
 automated bisection / inspection workflow.
 
-This project adds a minimal HTTP server inside FS-UAE itself, so external
-tools can:
+This project adds a minimal HTTP server, a WebSocket event stream, and
+an in-process GDB Remote Serial Protocol stub inside FS-UAE itself, so
+external tools can:
 
-- pause / resume the emulator
-- read the 68k CPU registers
-- read emulated memory at any address
-- save state snapshots to disk
+- pause / resume / single-step / step-over / step-out the emulator
+- set breakpoints (with optional skip-count + one-shot modes)
+- set memory watchpoints (with `mustchange` + value-match filters)
+- read and write CPU registers and emulated memory
+- disassemble with automatic AmigaOS library function annotation
+- enumerate memory map regions and walk the stack
+- save / restore state snapshots
+- subscribe to pause / resume / breakpoint / watchpoint events via WS
+- attach `gdb -tui` to the running emulator (m68k autoconfigured)
 
-…all over plain HTTP+JSON on `localhost`, with no GUI interaction.
+…all over plain HTTP+JSON + WebSocket + RSP on `localhost`, with no GUI
+interaction.
 
-The patch is **off by default** — set `FSUAE_RPC_PORT=8765` (or any port)
-to enable it. Without that env var, the patched binary is byte-for-byte
-behaviourally identical to upstream FS-UAE.
+The patch is **off by default** — set `FSUAE_RPC_PORT=8765` to enable
+the HTTP/WS/UI surface, and/or `FSUAE_GDB_PORT=2331` to enable the GDB
+stub. Without either, the patched binary is byte-for-byte behaviourally
+identical to upstream FS-UAE.
 
 ## Quick start (macOS / Linux)
 
@@ -71,15 +79,28 @@ fsuae_remote_patch/
 ├── README.md                         this file
 ├── LICENSE                           GPL-2.0 (matches FS-UAE)
 ├── build.sh                          one-shot clone + patch + build
-├── fsuae_rpc.cpp                     drop-in source file (~325 lines, no deps)
+├── run.sh                            launcher: build + start + open web UI
+├── fsuae_rpc.cpp                     drop-in source file (~3000 lines, no external deps)
+├── web_index.inc                     generated: embedded web UI
+├── web/
+│   └── index.html                    source for the embedded web UI
 ├── patches/
-│   └── 0001-fsuae-rpc-hook.patch     2-file unified diff (Makefile.am + main.cpp)
+│   └── 0001-fsuae-rpc-hook.patch     unified diff: Makefile.am + main.cpp + a few un-statics
 ├── docs/
-│   ├── PROTOCOL.md                   endpoint reference + JSON schemas
-│   └── ROADMAP.md                    v2 features (breakpoints, single-step, write)
+│   ├── DEBUGGING.md                  task-oriented guide (Web UI / HTTP / GDB / MCP)
+│   ├── USAGE.md                      quick-reference HTTP recipes
+│   ├── PROTOCOL.md                   full endpoint + RSP packet reference
+│   ├── ARCHITECTURE.md               how the patch works inside FS-UAE
+│   └── ROADMAP.md                    what's done, what's next
+├── tools/
+│   ├── embed_html.py                 build-time: web/index.html → web_index.inc
+│   ├── fsuae.gdbinit                 one-line attach script for gdb -tui
+│   ├── mcp_fsuae.py                  MCP stdio server (26 tools for LLM agents)
+│   └── uss_diff.py                   chunk-aware .uss savestate differ
 └── examples/
     ├── ping.sh                       smoke test
     ├── dump_cpu.sh                   pause + dump regs
+    ├── catch_chip_ram_init.sh        find first write to chip RAM
     ├── bisect_memory.sh              find when a memory location changes
     └── snapshot_loop.py              save state every N seconds
 ```
@@ -123,6 +144,8 @@ Frames are plain JSON, one per WebSocket message.  Eliminates polling
 | `POST /v1/pause` | `activate_debugger()` |
 | `POST /v1/resume` | `deactivate_debugger()` + auto-rearm watchpoints |
 | `POST /v1/step?n=N` | trace-step N instructions then re-pause |
+| `POST /v1/step?mode=over` | one-shot BP at `PC + insn_len`, then resume — skip past JSR/BSR |
+| `POST /v1/step?mode=out` | one-shot BP at `*(A7)` (return PC), then resume — run until function returns |
 | `POST /v1/reset?hard=0\|1` | `uae_reset()` (memwatch survives via post-reset hook) |
 
 **Inspection**
@@ -131,8 +154,10 @@ Frames are plain JSON, one per WebSocket message.  Eliminates polling
 |---|---|
 | `GET /v1/cpu` | `m68k_getpc()`, `regs.regs[0..15]`, `regs.sr`, `regs.usp`, `regs.isp` |
 | `GET /v1/mem?addr&len` | `get_byte_debug()` — same byte-read as the in-process debugger |
-| `GET /v1/disasm?addr&count` | `m68k_disasm_2()` into JSON lines |
+| `GET /v1/disasm?addr&count&annotate&library` | `m68k_disasm_2()` + library FD annotation |
 | `GET /v1/custom` | DMACON, INTENA/REQ, BPLCON0, COPxLC, BPLxPT, beam pos, … |
+| `GET /v1/memmap` | walks `mem_banks[]`, returns chip/slow/fast/ROM/IO/CIA/unmapped regions |
+| `GET /v1/stack?depth=N` | reads `(A7)`+, tags each long as `code` or `data` heuristically |
 
 **Mutation** (pause first for safety)
 
@@ -152,8 +177,8 @@ Frames are plain JSON, one per WebSocket message.  Eliminates polling
 
 | Endpoint | Wraps |
 |---|---|
-| `POST /v1/breakpoints?addr` | writes `bpnodes[]` directly |
-| `GET /v1/breakpoints` | reads `bpnodes[]` |
+| `POST /v1/breakpoints?addr&skip&oneshot` | writes `bpnodes[]` directly; optional skip-count + auto-clear |
+| `GET /v1/breakpoints` | reads `bpnodes[]` with hit counts and remaining skip |
 | `POST /v1/breakpoints/clear` | clears all `bpnodes[]` |
 | `POST /v1/watchpoints?addr&size&rwi&mustchange&val&valmask` | writes `mwnodes[]` + `memwatch_setup()` |
 | `GET /v1/watchpoints` | reads `mwnodes[]` |
@@ -167,6 +192,23 @@ Frames are plain JSON, one per WebSocket message.  Eliminates polling
 |---|---|
 | `GET /v1/symbols` | full table (~140 entries) — chipset regs, CIA-A/B, 68k vectors |
 | `GET /v1/symbols/lookup?addr=X` | name + description for that address (`null` if unknown) |
+
+**AmigaOS library Function Descriptors (.fd)**
+
+| Endpoint | Returns |
+|---|---|
+| `GET /v1/fd/exec` | built-in exec.library FD table (~95 entries) |
+| `GET /v1/fd/libraries` | list of loaded libraries (`exec` plus any `.fd`-loaded extras) |
+| `GET /v1/fd/list?library=NAME` | full function table for a loaded library |
+| `GET /v1/fd/lookup?offset=N&library=NAME` | look up by negative offset; falls back across libraries |
+| `POST /v1/fd/load?path=ABS&library=NAME` | parse a `.fd` file at runtime (graphics, intuition, dos, …) |
+
+**GDB Remote Serial Protocol** (independent listener — set `FSUAE_GDB_PORT`)
+
+A second TCP listener speaks GDB RSP directly to `bpnodes` / `mwnodes` / `regs` /
+`debug_write_memory_8` with no HTTP round-trip. Stop events push to blocked
+gdb workers via a 1 ms direct poll on `debugger_active`. Connect with
+`gdb -tui -x tools/fsuae.gdbinit`.
 
 The patch also:
 
@@ -212,8 +254,9 @@ install them manually first (Debian/Ubuntu names shown):
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `FSUAE_RPC_PORT` | *(unset)* | Port to listen on. Unset → RPC disabled. |
-| `FSUAE_RPC_PAUSE_AT_BOOT` | *(unset)* | `1` → emulator starts paused (lets you install breakpoints/watchpoints before any instruction runs). |
+| `FSUAE_RPC_PORT` | *(unset)* | Port for the HTTP/JSON-RPC + WebSocket + web UI. Unset → disabled. |
+| `FSUAE_GDB_PORT` | *(unset)* | Port for the in-process GDB Remote Serial Protocol stub. Unset → disabled. Independent of `FSUAE_RPC_PORT`. |
+| `FSUAE_RPC_PAUSE_AT_BOOT` | *(unset)* | `1` → emulator starts paused (lets you install breakpoints/watchpoints before any instruction runs). Applies to both backends. |
 | `FSUAE_SRC` | `/tmp/fsuae-src` | Where `build.sh` clones FS-UAE source. |
 | `FSUAE_TAG` | `v3.2.35` | Which FS-UAE tag to build. |
 | `FSUAE_URL` | `https://github.com/FrodeSolheim/fs-uae.git` | Source repo to clone. |
@@ -244,20 +287,22 @@ build system; the patch will need to be adapted.
 
 ## Roadmap
 
-Landed in this release: pause/resume, single-step, reset,
-breakpoints, watchpoints (with `mustchange` filter), memory R/W,
-register R/W, disassembly, chipset register snapshot, state save/load,
-sticky-pause via patched `console_get`, pause-at-boot.
+Landed: pause/resume, single-step, step-over, step-out, reset,
+breakpoints (with skip-count + one-shot), watchpoints (with
+`mustchange` + value-match filters, survive reset), memory R/W,
+register R/W, disassembly with multi-library FD annotation, chipset
+register snapshot, memory map, stack walker, state save/load,
+sticky-pause via patched `console_get`, pause-at-boot, WebSocket event
+stream, embedded web UI, MCP server, .uss snapshot diff tool,
+in-process GDB Remote Serial Protocol stub.
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next:
+See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next — short list:
 
-- Symbol lookup / source line mapping (Kickstart `.fd` files, `.sym` files)
-- Memory map endpoint (region descriptors: chip / slow / fast / ROM / IO)
-- Step-over (skip JSR/BSR) and step-out (run until RTS)
-- WebSocket event stream (notify on breakpoint hit instead of polling)
-- Debugger command pass-through (`POST /v1/debug?cmd=...`)
-- Frontend debugger (cross-platform UI built on this API)
-- MCP server wrapper (so LLM agents can drive FS-UAE natively)
+- Conditional breakpoints (in-emulator expression evaluation, faster than gdb-side conditions)
+- Per-slot BP / WP clear endpoints
+- Hunk-format executable loader (Amiga `HUNK_DEBUG` source lines)
+- A6 tracking for the disasm annotator (auto-pick the right library)
+- DWARF-driven source-level debugging for m68k-amigaos-gcc binaries
 - Windows port (currently compiles to a no-op stub on Win32)
 
 ## Background
