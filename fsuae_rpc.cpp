@@ -79,12 +79,23 @@
  *                                          classification (likely-code / data)
  *
  * v1 endpoints — breakpoints & watchpoints:
- *     POST /v1/breakpoints?addr=HEX&skip=N&oneshot=0|1
+ *     POST /v1/breakpoints?addr=HEX&skip=N&oneshot=0|1&trace=0|1&out=PATH
  *                                          install PC breakpoint, auto-pause on hit
  *                                          skip=N → silently ignore the first N hits
  *                                          oneshot=1 → auto-clear after first fire
+ *                                          trace=1 → silent capture-and-resume (NO
+ *                                            auto-pause; logs {pc, D0, A0, SP,
+ *                                            mem[SP]} per hit to the trace file).
+ *                                            Use for high-throughput in-emulator
+ *                                            instrumentation like "trace every
+ *                                            exec.Allocate call".  Zero cost when
+ *                                            no trace BPs are installed.
+ *                                          out=PATH → open trace output file
  *     GET  /v1/breakpoints                 list active breakpoints with hit counts
  *     POST /v1/breakpoints/clear           remove all breakpoints
+ *     GET  /v1/trace                       trace output state (path, open?, count)
+ *     POST /v1/trace?path=PATH             open/replace trace output file
+ *     POST /v1/trace                       close trace output file
  *     POST /v1/watchpoints?addr=HEX&size=N&rwi=W&mustchange=0|1
  *                              &val=HEX&valmask=HEX
  *                                          install memory watchpoint
@@ -452,14 +463,27 @@ static void rearm_watchpoints_if_any(void) {
     }
 }
 
+/* External — defined in debug.cpp.  These globals control single-stepping. */
+extern int debugging;
+
+/* Arm SPCFLAG_BRK + debugging + do_skip so the CPU loop starts calling
+ * debug() and checking BPs.  See debug.cpp for the helper definition.
+ * Without re-arming after /v1/resume, BPs sit dormant because
+ * deactivate_debugger() clears `debugging`. */
+extern "C" void fsuae_rpc_arm_bp_skip (void);
+
 static void ep_resume(int fd) {
     rearm_watchpoints_if_any();
     deactivate_debugger();
+    /* deactivate_debugger() clears `debugging`, which gates the CPU
+     * loop's debug() invocation.  If any BPs are installed (especially
+     * silent trace BPs), re-arm so SPCFLAG_BRK -> debug() -> BP-check
+     * keeps firing.  Without this, BPs sit dormant after resume. */
+    for (int i = 0; i < BREAKPOINT_TOTAL; i++) {
+        if (bpnodes[i].enabled) { fsuae_rpc_arm_bp_skip(); break; }
+    }
     send_response(fd, 200, "{\"ok\":true,\"state\":\"running\"}\n");
 }
-
-/* External — defined in debug.cpp.  These globals control single-stepping. */
-extern int debugging;
 
 /* ===== Per-breakpoint metadata (skip + oneshot) =====
  *
@@ -476,6 +500,98 @@ extern int debugging;
 static int bp_skip[BREAKPOINT_TOTAL];
 static int bp_hit_count[BREAKPOINT_TOTAL];
 static int bp_oneshot[BREAKPOINT_TOTAL];
+
+/* ===== Trace-BP state =====
+ *
+ * A trace BP fires inside the CPU loop (in debug.cpp's BP-match block),
+ * captures a fixed register snapshot to a file, and silently auto-resumes
+ * — no debugger_active set, no client poll, no 50 ms ws_pulse_thread
+ * latency.  Used for high-throughput in-emulator instrumentation like
+ * "trace every exec.Allocate call".
+ *
+ *   bp_trace[i]            non-zero if slot i is a trace BP
+ *   bp_trace_count_total   total trace-BPs installed (for the fast-exit
+ *                          check in fsuae_rpc_trace_bp_hook)
+ *   bp_trace_fp            single shared output file (line-buffered).
+ *                          NULL when no trace BPs configured.
+ *
+ * Zero-cost-when-disabled invariant: when bp_trace_count_total == 0 the
+ * hook returns 0 after a single load+compare.  No file I/O, no register
+ * reads, no allocations. */
+static int bp_trace[BREAKPOINT_TOTAL];
+static int bp_trace_count_total = 0;
+static FILE *bp_trace_fp = NULL;
+static char bp_trace_path[1024] = {0};
+static pthread_mutex_t bp_trace_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Called from debug.cpp's BP-match block on every breakpoint hit.
+ *
+ * Returns 1 if the BP was handled as a silent trace capture (the caller
+ * should treat the BP as not-fired and resume immediately).  Returns 0
+ * to let the normal BP machinery take over (auto-pause, surface to
+ * clients, possibly step-over).
+ *
+ * Zero-cost-when-disabled: a single load+compare on `bp_trace_count_total`
+ * is all that runs when no trace BPs are installed.  The mutex is only
+ * taken on actual trace-hits. */
+extern "C" int fsuae_rpc_trace_bp_hook (int slot, uae_u32 pc) {
+    if (bp_trace_count_total == 0) return 0;  /* fast exit */
+    if (slot < 0 || slot >= BREAKPOINT_TOTAL) return 0;
+    if (!bp_trace[slot]) return 0;
+    pthread_mutex_lock(&bp_trace_lock);
+    if (!bp_trace_fp) {
+        pthread_mutex_unlock(&bp_trace_lock);
+        return 0;  /* trace requested but no output file open */
+    }
+    bp_hit_count[slot]++;
+    int hit = bp_hit_count[slot];
+    /* Capture D0 (size), A0/A2/A3/A6 (memheader + commonly-used
+     * pointers in OS routines), A7 (caller SP), and a small stack
+     * window so the caller PC chain is visible.  exec.Allocate's
+     * calling convention: D0 = byte count, A0 = MemHeader.  When the
+     * BP is at Allocate's entry ($FC16D8), MOVEM hasn't run yet so
+     * stack[0] = direct caller (typically AllocMem at $FC17FC).
+     * stack[1] is one word further, often the higher-level caller. */
+    uae_u32 d0  = (uae_u32)regs.regs[0];
+    uae_u32 a0  = (uae_u32)regs.regs[8];
+    uae_u32 a2  = (uae_u32)regs.regs[10];
+    uae_u32 a3  = (uae_u32)regs.regs[11];
+    uae_u32 a6  = (uae_u32)regs.regs[14];
+    uae_u32 a7  = (uae_u32)regs.regs[15];
+    uae_u32 ret0 = (uae_u32)get_long_debug(a7);
+    uae_u32 ret1 = (uae_u32)get_long_debug(a7 + 4);
+    uae_u32 ret2 = (uae_u32)get_long_debug(a7 + 8);
+    uae_u32 ret3 = (uae_u32)get_long_debug(a7 + 12);
+    fprintf(bp_trace_fp,
+        "[BP-TRACE] slot=%d hit=%d pc=$%08X D0=%d $%08X A0=$%08X "
+        "A2=$%08X A3=$%08X A6=$%08X SP=$%08X "
+        "ret=$%08X s1=$%08X s2=$%08X s3=$%08X\n",
+        slot, hit, (unsigned)pc, (int)(int32_t)d0, (unsigned)d0,
+        (unsigned)a0, (unsigned)a2, (unsigned)a3, (unsigned)a6,
+        (unsigned)a7,
+        (unsigned)ret0, (unsigned)ret1, (unsigned)ret2, (unsigned)ret3);
+    /* line-buffered fopen("w") => fflush after each '\n' already; no
+     * explicit fflush needed.  Mutex held to serialise multi-thread
+     * writers (only the CPU thread should write today, but keep it
+     * safe). */
+    pthread_mutex_unlock(&bp_trace_lock);
+    return 1;
+}
+
+/* Open or replace the trace output file.  path == NULL => close & clear. */
+static int set_trace_path(const char *path) {
+    pthread_mutex_lock(&bp_trace_lock);
+    if (bp_trace_fp) { fclose(bp_trace_fp); bp_trace_fp = NULL; }
+    bp_trace_path[0] = 0;
+    if (path && *path) {
+        bp_trace_fp = fopen(path, "w");
+        if (!bp_trace_fp) { pthread_mutex_unlock(&bp_trace_lock); return -1; }
+        setvbuf(bp_trace_fp, NULL, _IOLBF, 0);  /* line buffered */
+        snprintf(bp_trace_path, sizeof bp_trace_path, "%s", path);
+    }
+    pthread_mutex_unlock(&bp_trace_lock);
+    return 0;
+}
 
 /* Install a one-shot BP at `addr` and resume.  Returns slot on success,
  * -1 on no-free-slot.  Used by step-over / step-out. */
@@ -624,12 +740,14 @@ static void ep_bp_list(int fd) {
         if (!bpnodes[i].enabled) continue;
         n += snprintf(body + n, sizeof body - n,
             "%s{\"slot\":%d,\"addr\":\"0x%08x\","
-             "\"skip_remaining\":%d,\"hit_count\":%d,\"oneshot\":%d}",
+             "\"skip_remaining\":%d,\"hit_count\":%d,\"oneshot\":%d,\"trace\":%d}",
             first ? "" : ",", i, (unsigned)bpnodes[i].addr,
-            bp_skip[i], bp_hit_count[i], bp_oneshot[i]);
+            bp_skip[i], bp_hit_count[i], bp_oneshot[i], bp_trace[i]);
         first = 0;
     }
-    n += snprintf(body + n, sizeof body - n, "]}\n");
+    n += snprintf(body + n, sizeof body - n,
+        "],\"trace_path\":\"%s\",\"trace_open\":%s}\n",
+        bp_trace_path, bp_trace_fp ? "true" : "false");
     send_response(fd, 200, body);
 }
 
@@ -657,6 +775,29 @@ static void ep_bp_add(int fd, const char *qs) {
     int oneshot = 0;
     char *os = get_query_param(qs, "oneshot");
     if (os && (os[0]=='1' || os[0]=='y' || os[0]=='Y')) oneshot = 1;
+    /* Optional: trace=1 — silent capture-and-resume mode.  When set, BP
+     * hits don't pause the emulator; instead, a snapshot {D0, A0, SP,
+     * mem[SP]} is logged to the trace file and the CPU continues.  See
+     * fsuae_rpc_trace_bp_hook above.  Requires an output file via the
+     * `out=PATH` query param OR a prior POST /v1/trace?path=PATH. */
+    int trace = 0;
+    char *ts = get_query_param(qs, "trace");
+    if (ts && (ts[0]=='1' || ts[0]=='y' || ts[0]=='Y')) trace = 1;
+    char *out = get_query_param(qs, "out");
+    if (out && *out) {
+        char out_buf[1024];
+        snprintf(out_buf, sizeof out_buf, "%s", out);
+        if (set_trace_path(out_buf) < 0) {
+            err_response(fd, 500, "could not open trace output file");
+            return;
+        }
+    }
+    if (trace && !bp_trace_fp) {
+        err_response(fd, 400,
+            "trace=1 requires an open trace file (pass out=PATH on this "
+            "request or call POST /v1/trace?path=PATH first)");
+        return;
+    }
     /* find first free slot */
     int slot = -1;
     for (int i = 0; i < BREAKPOINT_TOTAL; i++) {
@@ -671,11 +812,17 @@ static void ep_bp_add(int fd, const char *qs) {
     bp_skip[slot] = skip;
     bp_hit_count[slot] = 0;
     bp_oneshot[slot] = oneshot;
-    char body[256];
+    if (trace && !bp_trace[slot]) bp_trace_count_total++;
+    bp_trace[slot] = trace;
+    /* Arm the CPU's debug() loop so SPCFLAG_BRK fires and BPs get
+     * checked.  The in-process debugger handles this when the user
+     * types `g`; via RPC we set it directly. */
+    fsuae_rpc_arm_bp_skip();
+    char body[512];
     snprintf(body, sizeof body,
         "{\"ok\":true,\"slot\":%d,\"addr\":\"0x%08x\","
-        "\"skip\":%d,\"oneshot\":%d}\n",
-        slot, (unsigned)addr, skip, oneshot);
+        "\"skip\":%d,\"oneshot\":%d,\"trace\":%d,\"trace_path\":\"%s\"}\n",
+        slot, (unsigned)addr, skip, oneshot, trace, bp_trace_path);
     send_response(fd, 200, body);
 }
 
@@ -690,9 +837,39 @@ static void ep_bp_clear(int fd) {
         bp_skip[i] = 0;
         bp_hit_count[i] = 0;
         bp_oneshot[i] = 0;
+        bp_trace[i] = 0;
     }
+    bp_trace_count_total = 0;
     char body[128];
     snprintf(body, sizeof body, "{\"ok\":true,\"cleared\":%d}\n", cleared);
+    send_response(fd, 200, body);
+}
+
+/* POST /v1/trace?path=ABS    open/replace the trace output file
+ * POST /v1/trace             close it (passing no path)
+ * GET  /v1/trace             return current state (path, count of trace BPs) */
+static void ep_trace(int fd, const char *method, const char *qs) {
+    if (strcmp(method, "GET") == 0) {
+        char body[1280];
+        snprintf(body, sizeof body,
+            "{\"ok\":true,\"path\":\"%s\",\"open\":%s,"
+            "\"trace_bp_count\":%d}\n",
+            bp_trace_path, bp_trace_fp ? "true" : "false",
+            bp_trace_count_total);
+        send_response(fd, 200, body);
+        return;
+    }
+    char *p = get_query_param(qs, "path");
+    char path_buf[1024] = {0};
+    if (p) snprintf(path_buf, sizeof path_buf, "%s", p);
+    if (set_trace_path(p ? path_buf : NULL) < 0) {
+        err_response(fd, 500, "could not open path");
+        return;
+    }
+    char body[1280];
+    snprintf(body, sizeof body,
+        "{\"ok\":true,\"path\":\"%s\",\"open\":%s}\n",
+        bp_trace_path, bp_trace_fp ? "true" : "false");
     send_response(fd, 200, body);
 }
 
@@ -2954,6 +3131,9 @@ static void handle_request(int fd) {
         ep_bp_add(fd, qs);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/breakpoints/clear") == 0) {
         ep_bp_clear(fd);
+    } else if (strcmp(path, "/v1/trace") == 0 &&
+               (strcmp(method, "GET") == 0 || strcmp(method, "POST") == 0)) {
+        ep_trace(fd, method, qs);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/watchpoints") == 0) {
         ep_wp_list(fd);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/watchpoints") == 0) {

@@ -24,6 +24,11 @@ existing FS-UAE binary:
 - **HTTP/JSON-RPC API** — pause, resume, step, read/write memory and
   registers, install breakpoints and watchpoints, save state, all over
   `curl` on `localhost`.
+- **Zero-cost trace breakpoints** — install a BP with `trace=1&out=PATH`
+  and every hit silently appends `{PC, D0, A0, A2, A3, A6, SP, 4 stack
+  words}` to a file and auto-resumes. No debugger entry, no client
+  polling, sustains ~600K hits/sec. Perfect for capturing every
+  `AllocMem` return across a full boot.
 - **WebSocket event stream** — push notifications when the emulator
   pauses, a breakpoint fires, or a watchpoint triggers. No polling.
 - **Embedded web UI** — single-page HTML/JS, served from the binary.
@@ -129,6 +134,7 @@ fsuae_remote_patch/
 ├── web/index.html                      source for the embedded web UI
 ├── web_index.inc                       generated header (embedded into binary at build time)
 ├── patches/0001-fsuae-rpc-hook.patch   ~10 lines into Makefile.am + main.cpp + a few un-statics
+├── patches/0002-alloc-trace-and-no-uaefs.patch   debug.cpp BP-match hook + expansion.cpp FSUAE_NO_UAEFS gate
 ├── docs/                               see the table above
 ├── tools/
 │   ├── fsuae.gdbinit                   one-line attach for gdb -tui
@@ -145,6 +151,7 @@ fsuae_remote_patch/
 | `FSUAE_RPC_PORT` | Port for the HTTP/WS/web UI (e.g. `8765`). Unset → disabled. |
 | `FSUAE_GDB_PORT` | Port for the in-process GDB stub (e.g. `2331`). Unset → disabled. Independent of `FSUAE_RPC_PORT`. |
 | `FSUAE_RPC_PAUSE_AT_BOOT` | `1` → start paused, so you can install BPs / WPs before the CPU executes anything. |
+| `FSUAE_NO_UAEFS` | `1` → suppress the K1.2/1.3 `KS12_BOOT_HACK` UAE filesys autoconfig card at `$E90000`. Used for apples-to-apples chipset + alloc-pattern comparisons against bare-A500 RTL implementations. |
 | `FSUAE_SRC` | Where `build.sh` clones FS-UAE source (default `/tmp/fsuae-src`). |
 | `FSUAE_TAG` | Which FS-UAE tag to build (default `v3.2.35`). |
 

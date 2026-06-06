@@ -99,6 +99,18 @@ else
     fail "Patch does not apply cleanly to $FSUAE_TAG.  Regenerate the patch."
 fi
 
+# Layer 2: zero-cost alloc-trace BPs + FSUAE_NO_UAEFS env gate.
+# Header-only fuzzy patch — check first, apply if clean.  Failure here
+# is non-fatal so older builds still work without the trace feature.
+if [[ -f "$HERE/patches/0002-alloc-trace-and-no-uaefs.patch" ]]; then
+    if git -C "$FSUAE_SRC" apply --check "$HERE/patches/0002-alloc-trace-and-no-uaefs.patch" 2>/dev/null; then
+        git -C "$FSUAE_SRC" apply "$HERE/patches/0002-alloc-trace-and-no-uaefs.patch"
+        info "Applied patches/0002-alloc-trace-and-no-uaefs.patch (trace BP + NO_UAEFS gate)"
+    else
+        info "Skipped 0002-alloc-trace-and-no-uaefs.patch (does not apply cleanly)"
+    fi
+fi
+
 # -- 5. Configure + build --
 step "Bootstrap"
 ( cd "$FSUAE_SRC" && ./bootstrap )

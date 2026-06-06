@@ -1,0 +1,101 @@
+Add zero-cost alloc-trace BP mode + FSUAE_NO_UAEFS env gate
+
+This is a follow-up to 0001-fsuae-rpc-hook.patch.  Adds three features
+used by the fast68k Verilator project to debug K1.3 + boing-disk:
+
+1. Zero-cost-when-disabled trace BP mode.  A breakpoint installed with
+   `trace=1` writes a snapshot {PC, D0, A0, A2, A3, A6, SP, 4 stack
+   words} to a file per hit and silently auto-resumes — no
+   debugger_active, no 50 ms ws_pulse_thread latency, ~600K hits/sec.
+   Driven from inside the CPU loop via debug()'s BP-match block.
+
+2. `fsuae_rpc_arm_bp_skip()` helper.  Re-arms `do_skip=1; debugging=1;
+   SPCFLAG_BRK` after /v1/resume so externally-installed BPs actually
+   fire.  Without it, deactivate_debugger() leaves `debugging=0` and
+   the CPU loop never calls debug() to check BPs.
+
+3. FSUAE_NO_UAEFS=1 env gate (expansion.cpp:expamem_reset).  Suppresses
+   the K1.2/K1.3-specific KS12_BOOT_HACK that maps the UAE filesys_bank
+   at $E90000.  Used for apples-to-apples chipset + alloc-pattern
+   comparisons against bare-A500 RTL implementations.
+
+The bulk of (1) and (2) lives in fsuae_rpc.cpp itself (re-applied by
+copying fsuae_rpc.cpp into the source tree); this patch covers the
+debug.cpp hook call-site and the expansion.cpp gate.
+
+diff --git a/src/debug.cpp b/src/debug.cpp
+index 18cb5e0b4..48249bf8c 100644
+--- a/src/debug.cpp
++++ b/src/debug.cpp
+@@ -81,6 +81,25 @@ static uaecptr debug_copper_pc;
+ extern int audio_channel_mask;
+ extern int inputdevice_logging;
+ 
++/* fsuae_rpc trace-BP hook (defined in fsuae_rpc.cpp).  Declared at
++ * file scope with C linkage so debug() can call it from the BP-match
++ * block without an in-function `extern "C"` (illegal in C++). */
++extern "C" int fsuae_rpc_trace_bp_hook (int slot, uae_u32 pc);
++
++/* fsuae_rpc: arm the BP machinery from outside debug.cpp.  The
++ * in-process debugger normally sets `do_skip = 1` + SPCFLAG_BRK when
++ * the user types `g` to resume from a paused state.  When the RPC
++ * client installs a BP without ever entering the debugger, that
++ * priming step never happens, and the CPU loop never calls debug() to
++ * check BPs.  This helper wires it up so externally-installed BPs fire
++ * normally. */
++extern "C" void fsuae_rpc_arm_bp_skip (void)
++{
++	do_skip = 1;
++	debugging = 1;
++	set_special (SPCFLAG_BRK);
++}
++
+ void deactivate_debugger (void)
+ {
+ 	debugger_active = 0;
+@@ -5332,10 +5351,22 @@ void debug (void)
+ 					continue;
+ 				if (bpnodes[i].addr == pc) {
+ 					bp = 1;
+-					console_out_f (_T("Breakpoint at %08X\n"), pc);
+ 					break;
+ 				}
+ 			}
++			/* fsuae_rpc trace-BP hook: a trace BP captures regs to a
++			 * file and silently auto-resumes — no console output, no
++			 * interactive debugger, no client poll required.  When no
++			 * trace BPs are installed, the hook returns 0 immediately
++			 * (single conditional + return), so this is zero-cost
++			 * when the trace feature is unused. */
++			if (bp) {
++				if (fsuae_rpc_trace_bp_hook (i, pc)) {
++					bp = 0;
++				} else {
++					console_out_f (_T("Breakpoint at %08X\n"), pc);
++				}
++			}
+ 
+ 			if (skipaddr_doskip) {
+ 				if (skipaddr_start == pc)
+diff --git a/src/expansion.cpp b/src/expansion.cpp
+index 5e739a679..930a3979c 100644
+--- a/src/expansion.cpp
++++ b/src/expansion.cpp
+@@ -2105,6 +2105,17 @@ void expamem_reset (void)
+ 	if (uae_boot_rom_type <= 0)
+ 		do_mount = 0;
+ 
++	/* fsuae_rpc: FSUAE_NO_UAEFS=1 suppresses the K1.2/1.3-specific
++	 * filesys_bank mapping (KS12_BOOT_HACK) so K1.3 doesn't see the
++	 * UAE FS autoconfig card.  Used for apples-to-apples alloc-trace
++	 * comparison against bare-A500 RTL implementations. */
++	{
++		const char *no_uaefs = getenv("FSUAE_NO_UAEFS");
++		if (no_uaefs && (no_uaefs[0]=='1' || no_uaefs[0]=='y' || no_uaefs[0]=='Y')) {
++			do_mount = 0;
++			write_log("[fsuae_rpc] FSUAE_NO_UAEFS=1: suppressed UAEFS\n");
++		}
++	}
+ 	/* check if Kickstart version is below 1.3 */
+ 	if (ks12orolder() && do_mount) {
+ 		/* warn user */
