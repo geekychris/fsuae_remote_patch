@@ -91,6 +91,15 @@ git -C "$FSUAE_SRC" checkout "$FSUAE_TAG" -- . 2>/dev/null || git -C "$FSUAE_SRC
 step "Applying fsuae_rpc patch"
 cp -f "$HERE/fsuae_rpc.cpp" "$FSUAE_SRC/src/fsuae_rpc.cpp"
 info "Copied fsuae_rpc.cpp -> src/"
+# fsuae_rpc.cpp #include's web_index.inc (the embedded web UI).  If
+# the generated file isn't present yet (first build), regenerate it
+# from web/index.html via the embedder script.
+if [[ ! -f "$HERE/web_index.inc" || "$HERE/web/index.html" -nt "$HERE/web_index.inc" ]]; then
+    info "Regenerating web_index.inc from web/index.html"
+    python3 "$HERE/tools/embed_html.py" "$HERE/web/index.html" "$HERE/web_index.inc" 2>/dev/null || true
+fi
+cp -f "$HERE/web_index.inc" "$FSUAE_SRC/src/web_index.inc"
+info "Copied web_index.inc -> src/"
 
 if git -C "$FSUAE_SRC" apply --check "$HERE/patches/0001-fsuae-rpc-hook.patch" 2>/dev/null; then
     git -C "$FSUAE_SRC" apply "$HERE/patches/0001-fsuae-rpc-hook.patch"
