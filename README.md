@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="Fsuae Remote Patch logo" width="180">
+</p>
+
 # fsuae_remote_patch
 
 **An automation surface for [FS-UAE](https://fs-uae.net/) — drive the Amiga
