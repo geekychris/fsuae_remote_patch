@@ -82,16 +82,28 @@ diff --git a/src/main.cpp b/src/main.cpp
 index 7040dfe4..59e16624 100644
 --- a/src/main.cpp
 +++ b/src/main.cpp
-@@ -742,6 +742,8 @@ static int restart_program;
+@@ -742,6 +742,9 @@ static int restart_program;
  static TCHAR restart_config[MAX_DPATH];
  static int default_config;
- 
+
 +extern "C" void fsuae_rpc_init(void);
++extern "C" void fsuae_rpc_pre_quit(void);
 +
  void uae_reset (int hardreset, int keyboardreset)
  {
  	if (debug_dma) {
-@@ -1193,6 +1195,7 @@ static int real_main2 (int argc, TCHAR **argv)
+@@ -769,6 +772,10 @@ void uae_quit (void)
+ #ifdef FSUAE
+ 	write_log("uae_quit\n");
+ #endif
++	/* fsuae_rpc_pre_quit: snapshot state to FSUAE_RPC_SAVE_STATE_ON_QUIT
++	 * BEFORE deactivate_debugger / target_quit tear down emulator
++	 * subsystems.  No-op if the env var is unset. */
++	fsuae_rpc_pre_quit ();
+ 	deactivate_debugger ();
+ 	if (quit_program != -UAE_QUIT)
+ 		quit_program = -UAE_QUIT;
+@@ -1193,6 +1200,7 @@ static int real_main2 (int argc, TCHAR **argv)
  			}
  			currprefs.produce_sound = 0;
  		}

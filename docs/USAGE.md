@@ -92,6 +92,37 @@ curl -sX POST "$BASE/v1/state/save?path=/tmp/snap.uss"
 curl -sX POST "$BASE/v1/state/load?path=/tmp/snap.uss"
 ```
 
+### Headless: snapshot at the moment of process exit
+
+For CI / cosim flows where there's no client polling, set
+`FSUAE_RPC_SAVE_STATE_ON_QUIT` to an absolute path and combine with
+`quit_after_emulation_seconds` in the .fs-uae config.  The state
+snapshot is written automatically at process exit — no
+`/v1/state/save` call needed.
+
+```sh
+cat > /tmp/boot_capture.fs-uae <<EOF
+[fs-uae]
+amiga_model = A500
+kickstart_file = /path/to/kick_13.bin
+floppy_drive_0 = /path/to/your.adf
+chip_memory = 512
+slow_memory = 512
+warp_mode = 1
+fast_forward = 1
+quit_after_emulation_seconds = 30
+EOF
+
+FSUAE_RPC_SAVE_STATE_ON_QUIT=/tmp/boot.uss ./run.sh /tmp/boot_capture.fs-uae
+
+# State written to /tmp/boot.uss after ~30 s of emulated time.
+# Convert to Verilator snapshot for chipset cosim:
+python3 /path/to/68000/tools/fsuae_state.py /tmp/boot.uss /tmp/snap_dir
+```
+
+This works even without `FSUAE_RPC_PORT` — the atexit hook is
+registered any time the env var is set.
+
 ## Modify CPU registers and memory
 
 ```sh

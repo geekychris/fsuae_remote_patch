@@ -155,6 +155,7 @@ fsuae_remote_patch/
 | `FSUAE_RPC_PORT` | Port for the HTTP/WS/web UI (e.g. `8765`). Unset → disabled. |
 | `FSUAE_GDB_PORT` | Port for the in-process GDB stub (e.g. `2331`). Unset → disabled. Independent of `FSUAE_RPC_PORT`. |
 | `FSUAE_RPC_PAUSE_AT_BOOT` | `1` → start paused, so you can install BPs / WPs before the CPU executes anything. |
+| `FSUAE_RPC_SAVE_STATE_ON_QUIT` | Absolute path. Snapshot the emulator to a `.uss` at process exit. Independent of `FSUAE_RPC_PORT` — works in pure-headless mode (`quit_after_emulation_seconds = N` + this env var → no GUI interaction). Use with [`tools/fsuae_state.py`](https://github.com/your/68000-repo/tools/fsuae_state.py) to convert into a Verilator snapshot for chipset cosim. |
 | `FSUAE_NO_UAEFS` | `1` → suppress the K1.2/1.3 `KS12_BOOT_HACK` UAE filesys autoconfig card at `$E90000`. Used for apples-to-apples chipset + alloc-pattern comparisons against bare-A500 RTL implementations. |
 | `FSUAE_SRC` | Where `build.sh` clones FS-UAE source (default `/tmp/fsuae-src`). |
 | `FSUAE_TAG` | Which FS-UAE tag to build (default `v3.2.35`). |

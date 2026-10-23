@@ -12,6 +12,11 @@
  * Activation:
  *     FSUAE_RPC_PORT=8765 fs-uae <config>            (HTTP + WS + web UI)
  *     FSUAE_GDB_PORT=2331 fs-uae <config>            (GDB remote stub)
+ *     FSUAE_RPC_SAVE_STATE_ON_QUIT=/path/to/state.uss fs-uae <config>
+ *                                                    (save state snapshot
+ *                                                     at process exit — works
+ *                                                     headless with
+ *                                                     quit_after_emulation_seconds)
  *
  * The two ports are independent — enable either, both, or neither.  If
  * neither env var is set, this module is a no-op.  All listeners bind
@@ -716,6 +721,37 @@ static void ep_state_save(int fd, const char *qs) {
         send_response(fd, 200, body);
     } else {
         err_response(fd, 500, "save_state failed");
+    }
+}
+
+/* fsuae_rpc_pre_quit: snapshot the emulator state to a file at exit.
+ *
+ * Called from inside uae_quit() in main.cpp BEFORE the emulator
+ * subsystems are torn down (deactivate_debugger / target_quit).  If
+ * FSUAE_RPC_SAVE_STATE_ON_QUIT=<absolute-path> is set, save_state()
+ * writes a .uss to that path.  No-op otherwise — existing FS-UAE
+ * behaviour is preserved.
+ *
+ * Use case: headless cosim against FS-UAE.  Combined with
+ * `quit_after_emulation_seconds = N` in the .fs-uae config, this
+ * produces a state snapshot at exactly N emulated seconds of boot
+ * with zero keyboard interaction.  The resulting .uss can be parsed
+ * by tools/fsuae_state.py (in the 68000 repo) into a Verilator
+ * snapshot for byte-for-byte chip + slow + register diff. */
+extern "C" void fsuae_rpc_pre_quit(void) {
+    const char *path = getenv("FSUAE_RPC_SAVE_STATE_ON_QUIT");
+    if (!path || !*path) return;
+    char buf[1024];
+    snprintf(buf, sizeof buf, "%s", path);
+    /* save_state() returns 1 on success, 0 on failure (per savestate.cpp). */
+    int rc = save_state(buf, "fsuae-rpc auto-save on quit");
+    if (rc) {
+        fprintf(stderr,
+            "[fsuae-rpc] FSUAE_RPC_SAVE_STATE_ON_QUIT: wrote %s\n", buf);
+    } else {
+        fprintf(stderr,
+            "[fsuae-rpc] FSUAE_RPC_SAVE_STATE_ON_QUIT: save_state(%s) failed\n",
+            buf);
     }
 }
 
@@ -3287,5 +3323,18 @@ extern "C" void fsuae_rpc_init(void) {
     if (pause && (pause[0] == '1' || pause[0] == 'y' || pause[0] == 'Y')) {
         fprintf(stderr, "[fsuae-rpc] starting paused (FSUAE_RPC_PAUSE_AT_BOOT=1)\n");
         activate_debugger();
+    }
+
+    /* Optional: snapshot state on process exit.  Independent of
+     * FSUAE_RPC_PORT — useful even when the RPC threads aren't started
+     * (`quit_after_emulation_seconds = N` + this env var = headless
+     * cosim against FS-UAE).  See fsuae_rpc_pre_quit() — actual save
+     * happens when uae_quit() calls fsuae_rpc_pre_quit() from main.cpp
+     * BEFORE emulator subsystems are torn down.  We just log here. */
+    const char *q_path = getenv("FSUAE_RPC_SAVE_STATE_ON_QUIT");
+    if (q_path && *q_path) {
+        fprintf(stderr,
+            "[fsuae-rpc] will save state to %s on quit (via uae_quit hook)\n",
+            q_path);
     }
 }
