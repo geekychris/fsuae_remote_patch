@@ -85,7 +85,11 @@ if git -C "$FSUAE_SRC" sparse-checkout list >/dev/null 2>&1; then
     git -C "$FSUAE_SRC" sparse-checkout disable >/dev/null 2>&1 || true
 fi
 
-git -C "$FSUAE_SRC" checkout "$FSUAE_TAG" -- . 2>/dev/null || git -C "$FSUAE_SRC" checkout "$FSUAE_TAG"
+# Switch the whole tree to the tag. (`checkout TAG -- .` only overlays the tag's
+# files: anything newer branches added stays behind, and v3.2.35 then fails to
+# compile against master's include/uae.h.)
+git -C "$FSUAE_SRC" checkout -q --force --detach "$FSUAE_TAG"
+git -C "$FSUAE_SRC" clean -fdx --quiet -e fsuae_rpc.cpp -e src/fsuae_rpc.cpp
 
 # -- 4. Drop in fsuae_rpc.cpp + apply patch --
 step "Applying fsuae_rpc patch"
