@@ -124,6 +124,18 @@ if [[ -f "$HERE/patches/0002-alloc-trace-and-no-uaefs.patch" ]]; then
     fi
 fi
 
+# FSUAE_BLIT_LOG=path -> one line per blit start (registers, pointers,
+# size, modulos, masks, DAT presets).  Feed it to the 68000 project's
+# tools/blitlog_to_replay.py for crosscheck-minimig-blt REPLAY_FILE.
+if [[ -f "$HERE/patches/0003-blit-log.patch" ]]; then
+    if git -C "$FSUAE_SRC" apply --check "$HERE/patches/0003-blit-log.patch" 2>/dev/null; then
+        git -C "$FSUAE_SRC" apply "$HERE/patches/0003-blit-log.patch"
+        info "Applied patches/0003-blit-log.patch (FSUAE_BLIT_LOG)"
+    else
+        info "Skipped 0003-blit-log.patch (does not apply cleanly)"
+    fi
+fi
+
 # -- 5. Configure + build --
 step "Bootstrap"
 ( cd "$FSUAE_SRC" && ./bootstrap )
