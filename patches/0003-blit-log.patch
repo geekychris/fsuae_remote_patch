@@ -1,0 +1,37 @@
+diff --git a/src/blitter.cpp b/src/blitter.cpp
+index ec03178b4..8f5caaae7 100644
+--- a/src/blitter.cpp
++++ b/src/blitter.cpp
+@@ -1509,6 +1509,32 @@ static void do_blitter2 (int hpos, int copper)
+ 
+ 	blitter_start_init ();
+ 
++	/* fsuae_rpc: FSUAE_BLIT_LOG=path -> one line per blit start, same
++	 * field order as the 68000 RTL sim's [BLT_LOG] for line-by-line diff. */
++	{
++		static FILE *blit_log_f = NULL;
++		static int blit_log_init = 0;
++		static unsigned long blit_log_n = 0;
++		if (!blit_log_init) {
++			const char *pth = getenv ("FSUAE_BLIT_LOG");
++			blit_log_init = 1;
++			if (pth && *pth)
++				blit_log_f = fopen (pth, "w");
++		}
++		if (blit_log_f) {
++			fprintf (blit_log_f,
++				"%lu con=%04X%04X a=%06X b=%06X c=%06X d=%06X h=%d w=%d"
++				" mod=%04X,%04X,%04X,%04X fwm=%04X lwm=%04X dat=%04X,%04X,%04X\n",
++				blit_log_n++, bltcon0, bltcon1, bltapt, bltbpt, bltcpt, bltdpt,
++				blt_info.vblitsize, blt_info.hblitsize,
++				blt_info.bltamod & 0xffff, blt_info.bltbmod & 0xffff,
++				blt_info.bltcmod & 0xffff, blt_info.bltdmod & 0xffff,
++				blt_info.bltafwm, blt_info.bltalwm,
++				blt_info.bltadat, blt_info.bltbdat, blt_info.bltcdat);
++			fflush (blit_log_f);
++		}
++	}
++
+ 	if (blitline) {
+ 		cycles = blt_info.vblitsize;
+ 	} else {
