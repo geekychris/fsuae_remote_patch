@@ -62,6 +62,9 @@
  *
  * v1 endpoints — state snapshots:
  *     POST /v1/state/save?path=ABS_PATH    save state to absolute path
+ *     POST /v1/screenshot                  save the next frame as PNGs to
+ *                                          screenshots_output_dir (full = raw
+ *                                          emulated frame, unscaled)
  *     POST /v1/state/load?path=ABS_PATH    restore state from path
  *
  * v1 endpoints — symbol resolution:
@@ -1071,6 +1074,18 @@ static int hex_decode(const char *s, uae_u8 *out, int max) {
         out[n++] = (uae_u8)((v1 << 4) | v2);
     }
     return *s ? -1 : n;
+}
+
+/* POST /v1/screenshot: set libfsemu's screenshot flag; the renderer
+ * saves the next frame (same as the screenshot hotkey).  Files go to
+ * screenshots_output_dir as <prefix>-{full,crop,real}-<time>-NN.png;
+ * "full" is the unscaled emulated frame, the one to compare pixel by
+ * pixel.  The emulator must be running (not paused) for a frame to be
+ * rendered. */
+extern "C" int g_fs_emu_screenshot;
+static void ep_screenshot(int fd) {
+    g_fs_emu_screenshot = 1;
+    send_response(fd, 200, "{\"ok\":true}\n");
 }
 
 static void ep_mem_write(int fd, const char *qs) {
@@ -3178,6 +3193,8 @@ static void handle_request(int fd) {
         ep_wp_clear(fd);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/reset") == 0) {
         ep_reset(fd, qs);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/screenshot") == 0) {
+        ep_screenshot(fd);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/mem") == 0) {
         ep_mem_write(fd, qs);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/cpu") == 0) {
