@@ -67,6 +67,11 @@
  *                                          emulated frame, unscaled)
  *     POST /v1/state/load?path=ABS_PATH    restore state from path
  *
+ * v1 endpoints — input (emulator must be running):
+ *     POST /v1/key?code=HEX&state=0|1      Amiga raw key down (1) / up (0),
+ *                                          as from the host keyboard
+ *     POST /v1/mouse?button=N&state=0|1    mouse 0 button N (0=left, 1=right)
+ *
  * v1 endpoints — symbol resolution:
  *     GET  /v1/symbols                     full known-address table
  *     GET  /v1/symbols/lookup?addr=HEX     lookup name for an address
@@ -1085,6 +1090,35 @@ static int hex_decode(const char *s, uae_u8 *out, int max) {
 extern "C" int g_fs_emu_screenshot;
 static void ep_screenshot(int fd) {
     g_fs_emu_screenshot = 1;
+    send_response(fd, 200, "{\"ok\":true}\n");
+}
+
+/* POST /v1/key, /v1/mouse: inject input through the same paths as the host
+ * keyboard and mouse, so scripted runs (e.g. Left-Amiga+M to bring a screen
+ * to front) need no window focus.  Not synchronised with the emulation
+ * thread; fine for occasional debug input. */
+void inputdevice_do_keyboard(int code, int state);
+void setmousebuttonstate(int mouse, int button, int state);
+static void ep_key(int fd, const char *qs) {
+    /* get_query_param returns a shared static buffer: parse each value
+     * before fetching the next. */
+    char *cs = get_query_param(qs, "code");
+    if (!cs) { err_response(fd, 400, "missing code"); return; }
+    int code = (int)strtol(cs, NULL, 0);
+    char *ss = get_query_param(qs, "state");
+    if (!ss) { err_response(fd, 400, "missing state"); return; }
+    int state = atoi(ss);
+    if (code < 0 || code >= 0x80) { err_response(fd, 400, "code must be < 0x80"); return; }
+    inputdevice_do_keyboard(code, state ? 1 : 0);
+    send_response(fd, 200, "{\"ok\":true}\n");
+}
+static void ep_mouse(int fd, const char *qs) {
+    char *bs = get_query_param(qs, "button");
+    if (!bs) { err_response(fd, 400, "missing button"); return; }
+    int button = atoi(bs);
+    char *ss = get_query_param(qs, "state");
+    if (!ss) { err_response(fd, 400, "missing state"); return; }
+    setmousebuttonstate(0, button, atoi(ss) ? 1 : 0);
     send_response(fd, 200, "{\"ok\":true}\n");
 }
 
@@ -3195,6 +3229,10 @@ static void handle_request(int fd) {
         ep_reset(fd, qs);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/screenshot") == 0) {
         ep_screenshot(fd);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/key") == 0) {
+        ep_key(fd, qs);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/mouse") == 0) {
+        ep_mouse(fd, qs);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/mem") == 0) {
         ep_mem_write(fd, qs);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/cpu") == 0) {
